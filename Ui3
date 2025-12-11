@@ -1,0 +1,409 @@
+
+/**
+ * Mini DevTools+ (Mobile First Edition)
+ * Full combined rewritten version
+ * Touch-friendly • Performant • Safe • Modular
+ */
+
+(() => {
+  "use strict";
+
+  /* ============================================================
+   * Persistent Storage
+   * ============================================================ */
+  const STORAGE_KEY_SNIPPETS = "mcc_snippets_v2";
+  const STORAGE_KEY_SIZE = "mcc_panel_size_v2";
+  const STORAGE_KEY_POS = "mcc_button_pos_v2";
+  const STORAGE_KEY_MIN = "mcc_min_v2";
+
+  let snippets =
+    JSON.parse(localStorage.getItem(STORAGE_KEY_SNIPPETS) || "{}");
+
+  function saveSnippets() {
+    localStorage.setItem(STORAGE_KEY_SNIPPETS, JSON.stringify(snippets));
+  }
+
+  /* ============================================================
+   * State
+   * ============================================================ */
+  let activeTab = "WS";
+  const logs = { ws: [], xhr: [], pm: [] };
+
+  /* ============================================================
+   * DOM: Floating Button
+   * ============================================================ */
+  const floatBtn = document.createElement("div");
+  Object.assign(floatBtn.style, {
+    position: "fixed",
+    top: "40px",
+    left: "10px",
+    width: "56px",
+    height: "56px",
+    background: "#1e1e1e",
+    color: "#fff",
+    borderRadius: "50%",
+    display: "flex",
+    justifyContent: "center",
+    alignItems: "center",
+    fontSize: "28px",
+    zIndex: 999999,
+    boxShadow: "0 0 10px #000",
+    touchAction: "none",
+    userSelect: "none",
+    cursor: "pointer",
+  });
+  floatBtn.textContent = "≡";
+  document.body.appendChild(floatBtn);
+
+  restoreButtonPosition();
+
+  /* Drag floating button */
+  (() => {
+    let startX, startY, sLeft, sTop, dragging = false;
+    floatBtn.addEventListener("pointerdown", (e) => {
+      dragging = true;
+      startX = e.clientX;
+      startY = e.clientY;
+      sLeft = floatBtn.offsetLeft;
+      sTop = floatBtn.offsetTop;
+      floatBtn.setPointerCapture(e.pointerId);
+    });
+
+    floatBtn.addEventListener("pointermove", (e) => {
+      if (!dragging) return;
+      floatBtn.style.left = sLeft + (e.clientX - startX) + "px";
+      floatBtn.style.top = sTop + (e.clientY - startY) + "px";
+    });
+
+    floatBtn.addEventListener("pointerup", (e) => {
+      dragging = false;
+      floatBtn.releasePointerCapture(e.pointerId);
+      saveButtonPosition();
+    });
+  })();
+
+  function saveButtonPosition() {
+    localStorage.setItem(
+      STORAGE_KEY_POS,
+      JSON.stringify({
+        left: floatBtn.style.left,
+        top: floatBtn.style.top,
+      })
+    );
+  }
+
+  function restoreButtonPosition() {
+    const saved = JSON.parse(localStorage.getItem(STORAGE_KEY_POS) || "null");
+    if (saved) {
+      floatBtn.style.left = saved.left;
+      floatBtn.style.top = saved.top;
+    }
+  }
+
+  /* ============================================================
+   * DOM: Slide-In Panel
+   * ============================================================ */
+  const panel = document.createElement("div");
+  Object.assign(panel.style, {
+    position: "fixed",
+    top: "0px",
+    right: "-85%",
+    width: "85%",
+    height: "100%",
+    background: "#111",
+    color: "#fff",
+    zIndex: 999998,
+    boxShadow: "0 0 15px #000",
+    display: "flex",
+    flexDirection: "column",
+    transition: "right 0.25s ease",
+    fontFamily: "monospace",
+    overflow: "hidden",
+  });
+  document.body.appendChild(panel);
+
+  let panelOpen = false;
+
+  function openPanel() {
+    panel.style.right = "0";
+    panelOpen = true;
+  }
+  function closePanel() {
+    panel.style.right = "-85%";
+    panelOpen = false;
+  }
+
+  floatBtn.onclick = () => {
+    panelOpen ? closePanel() : openPanel();
+  };
+
+  /* ============================================================
+   * Panel Layout
+   * ============================================================ */
+  panel.innerHTML = `
+    <div id="mcc-header" style="
+      background:#222;padding:12px;font-size:20px;
+      display:flex;justify-content:space-between;
+      align-items:center;touch-action:none;">
+      <span>Mini DevTools+</span>
+      <button id="mcc-close" style="
+        font-size:20px;background:#444;color:#fff;
+        border:none;padding:6px 14px;border-radius:6px;">X</button>
+    </div>
+
+    <div id="mcc-tabs" style="
+      display:flex;gap:4px;padding:6px;background:#000;">
+      <button data-tab="WS">WS</button>
+      <button data-tab="XHR">XHR</button>
+      <button data-tab="PM">PostMessage</button>
+      <button data-tab="SN">Snippets</button>
+    </div>
+
+    <div id="mcc-content" style="
+      flex:1;overflow:auto;font-size:12px;padding:6px;">
+    </div>
+  `;
+
+  panel.querySelector("#mcc-close").onclick = closePanel;
+
+  const content = panel.querySelector("#mcc-content");
+
+  [...panel.querySelectorAll("#mcc-tabs button")].forEach((btn) => {
+    btn.onclick = () => {
+      activeTab = btn.dataset.tab;
+      drawActiveTab();
+    };
+  });
+
+  /* ============================================================
+   * Renderers
+   * ============================================================ */
+
+  function drawActiveTab() {
+    if (activeTab === "SN") return drawSnippets();
+
+    const type = activeTab === "WS" ? "ws"
+               : activeTab === "XHR" ? "xhr"
+               : "pm";
+
+    const arr = logs[type];
+
+    content.innerHTML = `
+      <div style="color:#aaa;margin-bottom:4px;">
+        Showing last ${arr.length} ${activeTab} entries
+      </div>
+    `;
+
+    arr.forEach((entry) => {
+      const pre = document.createElement("pre");
+      Object.assign(pre.style, {
+        background: "#000",
+        padding: "6px",
+        marginBottom: "4px",
+        borderRadius: "6px",
+        whiteSpace: "pre-wrap",
+      });
+      pre.textContent = safeDecode(entry.data);
+      content.appendChild(pre);
+    });
+  }
+
+  /* ============================================================
+   * Decode helper
+   * ============================================================ */
+  function safeDecode(d) {
+    try {
+      if (typeof d === "string") {
+        try { return JSON.stringify(JSON.parse(d), null, 2); }
+        catch {}
+        return d;
+      }
+      if (d instanceof ArrayBuffer) {
+        const u8 = new Uint8Array(d).slice(0, 16);
+        return `[ArrayBuffer ${d.byteLength} bytes] ${[...u8].map(v=>v.toString(16)).join(" ")}...`;
+      }
+      return JSON.stringify(d, null, 2);
+    } catch {
+      return "[decode error]";
+    }
+  }
+
+  /* ============================================================
+   * Snippet UI
+   * ============================================================ */
+  function drawSnippets() {
+    content.innerHTML = `
+      <div style="display:flex;flex-direction:column;gap:6px;">
+        <textarea id="sn-code" rows="7"
+          style="width:100%;background:#000;color:#fff;"></textarea>
+
+        <input id="sn-name" placeholder="Snippet name"
+          style="padding:8px;background:#000;color:#fff;border:1px solid #333;">
+
+        <select id="sn-target"
+          style="padding:8px;background:#000;color:#fff;border:1px solid #333;">
+        </select>
+
+        <select id="sn-auto"
+          style="padding:8px;background:#000;color:#fff;border:1px solid #333;">
+          <option value="manual">manual</option>
+          <option value="load">load</option>
+          <option value="hook">hook</option>
+          <option value="always">always</option>
+        </select>
+
+        <button id="sn-save"
+          style="padding:10px;background:#222;color:#fff;">Save</button>
+        <button id="sn-run"
+          style="padding:10px;background:#444;color:#fff;">Run</button>
+      </div>
+    `;
+
+    const snCode = content.querySelector("#sn-code");
+    const snName = content.querySelector("#sn-name");
+    const snAuto = content.querySelector("#sn-auto");
+    const snTarget = content.querySelector("#sn-target");
+
+    /* Populate iframe list */
+    const frames = getFrames();
+    frames.forEach((frm, i) => {
+      const opt = document.createElement("option");
+      opt.value = i;
+      opt.textContent = frm.label;
+      snTarget.appendChild(opt);
+    });
+
+    content.querySelector("#sn-save").onclick = () => {
+      const name = snName.value.trim();
+      if (!name) return alert("No name");
+      snippets[name] = {
+        code: snCode.value,
+        autorun: snAuto.value,
+        target: parseInt(snTarget.value),
+      };
+      saveSnippets();
+      alert("Saved");
+    };
+
+    content.querySelector("#sn-run").onclick = () => {
+      const name = snName.value.trim();
+      if (!snippets[name]) return alert("No snippet");
+      execSnippet(snippets[name]);
+    };
+  }
+
+  function execSnippet(sn) {
+    const frames = getFrames();
+    const targetWin = frames[sn.target]?.win || window;
+    try { targetWin.eval(sn.code); }
+    catch (e) { console.warn(e); }
+  }
+
+  /* ============================================================
+   * Iframe scanning
+   * ============================================================ */
+  function getFrames() {
+    const arr = [{ win: window, label: "Top Window" }];
+    [...document.querySelectorAll("iframe")].forEach((f, i) => {
+      try {
+        arr.push({
+          win: f.contentWindow,
+          label: f.name || f.src || ("iframe " + i),
+        });
+      } catch {}
+    });
+    return arr;
+  }
+
+  /* ============================================================
+   * Autorun handling
+   * ============================================================ */
+  window.addEventListener("load", () => {
+    Object.values(snippets).forEach((sn) => {
+      if (sn.autorun === "load" || sn.autorun === "always") {
+        execSnippet(sn);
+      }
+    });
+  });
+
+  /* ============================================================
+   * Hooks: WebSocket / XHR / Fetch / postMessage
+   * ============================================================ */
+
+  /* WebSocket */
+  const WS = window.WebSocket;
+  window.WebSocket = function (...args) {
+    const ws = new WS(...args);
+    ws.addEventListener("message", (ev) => {
+      logs.ws.push({ data: ev.data });
+      autoOpenOnHook("ws");
+      if (activeTab === "WS") drawActiveTab();
+    });
+    return ws;
+  };
+
+  /* XHR */
+  const XHR = window.XMLHttpRequest;
+  window.XMLHttpRequest = function () {
+    const x = new XHR();
+    const origOpen = x.open;
+    x.open = function (m, u, ...rest) {
+      x._url = u;
+      return origOpen.call(x, m, u, ...rest);
+    };
+    x.addEventListener("load", () => {
+      logs.xhr.push({ data: { url: x._url, response: x.response } });
+      autoOpenOnHook("xhr");
+      if (activeTab === "XHR") drawActiveTab();
+    });
+    return x;
+  };
+
+  /* Fetch */
+  const fetchOrig = window.fetch;
+  window.fetch = function (...args) {
+    return fetchOrig(...args).then((res) => {
+      res.clone().text().then((txt) => {
+        logs.xhr.push({ data: { url: args[0], response: txt } });
+        autoOpenOnHook("xhr");
+        if (activeTab === "XHR") drawActiveTab();
+      });
+      return res;
+    });
+  };
+
+  /* postMessage */
+  const origPM = window.postMessage;
+  window.postMessage = new Proxy(origPM, {
+    apply(target, thisArg, args) {
+      let msg;
+      try { msg = structuredClone(args[0]); }
+      catch { msg = args[0]; }
+
+      logs.pm.push({ data: msg });
+      autoOpenOnHook("pm");
+      if (activeTab === "PM") drawActiveTab();
+
+      Object.values(snippets).forEach(sn => {
+        if (sn.autorun === "hook") execSnippet(sn);
+        if (sn.autorun === "always") execSnippet(sn);
+      });
+
+      return target.apply(thisArg, args);
+    },
+  });
+
+  window.addEventListener("message", (e) => {
+    logs.pm.push({ data: e.data });
+    autoOpenOnHook("pm");
+    if (activeTab === "PM") drawActiveTab();
+  });
+
+  /* ============================================================
+   * Auto-popup on network activity
+   * ============================================================ */
+  function autoOpenOnHook(type) {
+    openPanel();
+  }
+
+})();
