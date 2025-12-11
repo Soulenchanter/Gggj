@@ -1,0 +1,1010 @@
+// ==UserScript==
+// @name         Network Control + Clones + ARC (Integrated)
+// @namespace    https://example.local/
+// @version      1.2.0
+// @description  Capture fetch/XHR/WS/postMessage; clones with tree editor & ticks; sparse auto-replace; ARC (auto rain claim) with UI toggle & delay slider.
+// @match        *://*/*
+// @grant        none
+// @run-at       document-start
+// ==/UserScript==
+
+(() => {
+  'use strict';
+
+  // Avoid double-load
+  if (window.__NC_INTEGRATED_LOADED__) return;
+  window.__NC_INTEGRATED_LOADED__ = true;
+
+  /* ========================
+     CONFIG & STORAGE KEYS
+     ======================== */
+  const SK = {
+    CLONES: 'nc_clones_v2',
+    LOGS: 'nc_logs_v2',
+    SETTINGS: 'nc_settings_v2',
+  };
+
+  const DEFAULTS = {
+    maxLogs: 2000,
+    maxMessages: 2000,
+    sizeLimitKB: 512,
+    autoOpenThrottleMs: 600,
+    arc: {
+      enabled: true,
+      delayMs: 0,
+      minDelay: 0,
+      maxDelay: 2000,
+      maxAttempts: 3,
+      initialRetryMs: 200,
+      retryFactor: 2,
+      confirmTimeoutMs: 4000,
+      dedupeMemoryMs: 60 * 1000
+    }
+  };
+
+  /* ========================
+     UTILITIES
+     ======================== */
+  function lsGet(k, fallback) { try { const r = localStorage.getItem(k); return r ? JSON.parse(r) : fallback; } catch { return fallback; } }
+  function lsSet(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch { } }
+  function uid(pref = 'id') { return pref + '_' + Math.random().toString(36).slice(2,9); }
+  function nowIso() { return new Date().toISOString(); }
+  function safeJSONParse(s) { try { return JSON.parse(s); } catch { return null; } }
+  function isString(x) { return typeof x === 'string'; }
+
+  /* ========================
+     PERSISTENT STATE
+     ======================== */
+  let CLONES = lsGet(SK.CLONES, []);
+  let LOGS = lsGet(SK.LOGS, { requests: [], messages: [] });
+  let SETTINGS = lsGet(SK.SETTINGS, { maxLogs: DEFAULTS.maxLogs, sizeLimitKB: DEFAULTS.sizeLimitKB, arc: DEFAULTS.arc });
+
+  function persistAll() { lsSet(SK.CLONES, CLONES); lsSet(SK.LOGS, LOGS); lsSet(SK.SETTINGS, SETTINGS); }
+
+  /* ========================
+     SAFE CLONE & PLACEHOLDERS
+     ======================== */
+  function safeClone(obj) {
+    if (obj === null || typeof obj !== 'object') return obj;
+    if (obj instanceof Date) return new Date(obj);
+    if (Array.isArray(obj)) return obj.map(safeClone);
+    try {
+      if (typeof Blob !== 'undefined' && obj instanceof Blob) {
+        return { __placeholder: true, kind: 'Blob', type: obj.type || '', size: obj.size || 0, _b64: null };
+      }
+      if (typeof File !== 'undefined' && obj instanceof File) {
+        return { __placeholder: true, kind: 'File', name: obj.name || '', type: obj.type || '', size: obj.size || 0, _b64: null };
+      }
+      if (obj instanceof ArrayBuffer || ArrayBuffer.isView(obj)) {
+        const len = obj.byteLength || (obj.buffer && obj.buffer.byteLength) || 0;
+        return { __placeholder: true, kind: 'ArrayBuffer', byteLength: len };
+      }
+    } catch (e) {}
+    const out = {};
+    for (const k in obj) {
+      try { out[k] = safeClone(obj[k]); } catch { out[k] = String(obj[k]); }
+    }
+    return out;
+  }
+
+  async function blobToBase64(blob) {
+    return new Promise((res, rej) => {
+      try {
+        const fr = new FileReader();
+        fr.onload = () => { res((fr.result||'').split(',')[1] || ''); };
+        fr.onerror = rej;
+        fr.readAsDataURL(blob);
+      } catch (e) { rej(e); }
+    });
+  }
+  function base64ToBlob(b64, type='application/octet-stream') {
+    try {
+      const bin = atob(b64);
+      const len = bin.length;
+      const arr = new Uint8Array(len);
+      for (let i=0;i<len;i++) arr[i] = bin.charCodeAt(i);
+      return new Blob([arr], { type });
+    } catch (e) { return null; }
+  }
+  function revivePlaceholders(obj) {
+    if (obj === null || typeof obj !== 'object') return obj;
+    if (Array.isArray(obj)) return obj.map(revivePlaceholders);
+    if (obj.__placeholder) {
+      if (obj._b64) return base64ToBlob(obj._b64, obj.type || '');
+      return obj;
+    }
+    const out = {};
+    for (const k in obj) out[k] = revivePlaceholders(obj[k]);
+    return out;
+  }
+
+  /* ========================
+     UI: Floating Button + Panel
+     ======================== */
+  const BTN_ID = '__nc_open_btn_v2', PANEL_ID = '__nc_panel_v2';
+  if (document.getElementById(BTN_ID) || document.getElementById(PANEL_ID)) {
+    // already present
+  } else {
+    const css = `
+    #${PANEL_ID} { position: fixed; right: 0; top: 0; width: 86%; max-width:980px; height:100%; background: #0d0d0d; color:#e6e6e6; z-index:2147483647; font-family: monospace; display:flex; flex-direction:column; transition: transform .22s ease; transform: translateX(100%); box-shadow: -6px 0 30px rgba(0,0,0,.8); }
+    #${PANEL_ID}.open { transform: translateX(0); }
+    #${PANEL_ID} .hdr { background:#111; padding:10px; display:flex; gap:8px; align-items:center; }
+    #${PANEL_ID} .tabs { display:flex; gap:6px; padding:8px; background:#070707; border-bottom:1px solid #222; }
+    #${PANEL_ID} .tabs button { background:#0b0b0b; color:inherit; border:1px solid #222; padding:6px 8px; border-radius:6px; cursor:pointer; }
+    #${PANEL_ID} .content { flex:1; overflow:auto; padding:8px; font-size:13px; }
+    #${PANEL_ID} .list-item { background:#0a0a0a; padding:8px; margin-bottom:8px; border-radius:6px; cursor:pointer; white-space:pre-wrap; }
+    #${BTN_ID} { position: fixed; left: 12px; top: 60px; width:56px; height:56px; border-radius:50%; background:#111; color:#fff; display:flex; align-items:center; justify-content:center; z-index:2147483647; box-shadow:0 6px 20px rgba(0,0,0,.6); cursor:grab; touch-action:none; }
+    .nc-mini-btn { background:#1a7a1a; color:#fff; border-radius:6px; padding:6px 8px; cursor:pointer; border:none; }
+    .nc-pre { background:#050505; padding:8px; border-radius:6px; white-space:pre-wrap; overflow-x:auto; }
+    .nc-small { font-size:12px; padding:4px 6px; border-radius:4px; background:#111; border:1px solid #222; color:#ddd; }
+    `;
+    const style = document.createElement('style'); style.textContent = css; document.documentElement.appendChild(style);
+
+    const openBtn = document.createElement('div');
+    openBtn.id = BTN_ID; openBtn.textContent = '≡';
+    document.body.appendChild(openBtn);
+    (function dragBtn(){
+      let dragging=false, sx=0, sy=0, sl=12, st=60;
+      openBtn.addEventListener('pointerdown', e=>{ dragging=true; sx=e.clientX; sy=e.clientY; sl=openBtn.offsetLeft; st=openBtn.offsetTop; openBtn.setPointerCapture(e.pointerId); });
+      openBtn.addEventListener('pointermove', e=>{ if(!dragging) return; openBtn.style.left = (sl + (e.clientX - sx)) + 'px'; openBtn.style.top = (st + (e.clientY - sy)) + 'px'; });
+      openBtn.addEventListener('pointerup', e=>{ dragging=false; try{openBtn.releasePointerCapture(e.pointerId);}catch{} });
+    })();
+
+    const panel = document.createElement('div'); panel.id = PANEL_ID;
+    panel.innerHTML = `
+      <div class="hdr"><div style="font-weight:700">Network Control</div>
+        <div style="margin-left:auto; display:flex; gap:8px; align-items:center;">
+          <label style="display:flex;align-items:center;color:#cfc"><input id="arc_toggle_ui" type="checkbox" style="margin-right:6px"/>AutoClaim</label>
+          <input id="arc_delay_ui" type="range" min="0" max="${DEFAULTS.arc.maxDelay}" value="${SETTINGS.arc?.delayMs ?? DEFAULTS.arc.delayMs}" style="width:150px"/>
+          <span id="arc_delay_label" class="nc-small"></span>
+          <button id="nc_close" class="nc-mini-btn">Close</button>
+        </div>
+      </div>
+      <div class="tabs">
+        <button data-tab="logs">Logs</button>
+        <button data-tab="clones">Clones</button>
+        <button data-tab="editor">Editor</button>
+        <button data-tab="replay">Replay</button>
+        <button data-tab="settings">Settings</button>
+      </div>
+      <div class="content" id="nc_content"></div>
+    `;
+    document.body.appendChild(panel);
+
+    document.getElementById('nc_close').onclick = ()=> panel.classList.remove('open');
+    openBtn.onclick = ()=> panel.classList.toggle('open');
+
+    // Setup ARC UI initial state
+    const arcToggleUi = document.getElementById('arc_toggle_ui');
+    const arcDelayUi = document.getElementById('arc_delay_ui');
+    const arcDelayLabel = document.getElementById('arc_delay_label');
+    arcToggleUi.checked = !!(SETTINGS.arc && SETTINGS.arc.enabled);
+    arcDelayUi.value = (SETTINGS.arc && typeof SETTINGS.arc.delayMs === 'number') ? SETTINGS.arc.delayMs : DEFAULTS.arc.delayMs;
+    arcDelayLabel.textContent = arcDelayUi.value + 'ms';
+
+    arcToggleUi.addEventListener('change', () => { SETTINGS.arc = SETTINGS.arc || {}; SETTINGS.arc.enabled = arcToggleUi.checked; persistAll(); });
+    arcDelayUi.addEventListener('input', () => { arcDelayLabel.textContent = arcDelayUi.value + 'ms'; });
+    arcDelayUi.addEventListener('change', () => { SETTINGS.arc = SETTINGS.arc || {}; SETTINGS.arc.delayMs = parseInt(arcDelayUi.value, 10); persistAll(); });
+
+    // Tab handlers
+    const contentEl = document.getElementById('nc_content');
+    const tabButtons = [...panel.querySelectorAll('.tabs button')];
+    let currentTab = 'logs';
+    tabButtons.forEach(b => b.addEventListener('click', () => { currentTab = b.dataset.tab; renderTab(); }));
+  }
+
+  /* ========================
+     JSON Tree Editor (simplified)
+     returns { container, getEdited, setData, rerender }
+     ======================== */
+  function createJsonTreeEditor(dataObj) {
+    function el(tag='div', props={}, style={}) { const d=document.createElement(tag); Object.assign(d, props); Object.assign(d.style, style); return d; }
+    function getByPath(obj, path) { let o=obj; for (const p of path) o = o[p]; return o; }
+    function setByPath(obj, path, val) { let o=obj; for (let i=0;i<path.length-1;i++) o = o[path[i]]; o[path[path.length-1]] = val; }
+    function delByPath(obj, path) { let o=obj; for (let i=0;i<path.length-1;i++) o = o[path[i]]; const k=path[path.length-1]; if (Array.isArray(o)) o.splice(k,1); else delete o[k]; }
+
+    const root = { data: dataObj };
+    const container = el('div', {}, { fontFamily:'monospace', fontSize:'13px' });
+
+    function buildNode(key, value, path) {
+      const node = el('div', {}, { marginLeft: path.length ? '12px' : '0', marginBottom:'6px' });
+      const row = el('div', {}, { display:'flex', gap:'6px', alignItems:'center' });
+
+      const isObj = value && typeof value === 'object';
+      const toggle = el('span', { textContent: isObj ? '▾' : '' }, { cursor: isObj ? 'pointer' : 'default', width:'14px' });
+      row.appendChild(toggle);
+
+      const keyInput = el('input', { value: key, disabled: path.length===0 }, { width: '140px', background:'#111', color:'#cfc', border:'1px solid #222', padding:'4px' });
+      row.appendChild(keyInput);
+
+      if (!isObj) {
+        const valInput = el('input', { value: typeof value === 'string' ? value : JSON.stringify(value) }, { flex:'1', background:'#111', color:'#cfc', border:'1px solid #222', padding:'4px' });
+        valInput.onchange = () => {
+          let parsed = valInput.value;
+          try { parsed = JSON.parse(valInput.value); } catch { }
+          setByPath(root.data, path.concat(key), parsed);
+        };
+        row.appendChild(valInput);
+      } else {
+        const summary = el('span', { textContent: Array.isArray(value) ? `Array(${value.length})` : 'Object' }, { color:'#9f9' });
+        row.appendChild(summary);
+      }
+
+      const addBtn = el('button', { textContent:'+' }, { padding:'4px', marginLeft:'6px' });
+      addBtn.onclick = () => { const parent = getByPath(root.data, path); if (Array.isArray(parent)) parent.push(''); else parent['newKey'] = ''; rerender(); };
+      row.appendChild(addBtn);
+
+      const delBtn = el('button', { textContent:'✕' }, { padding:'4px' });
+      delBtn.onclick = () => { delByPath(root.data, path.concat(key)); rerender(); };
+      row.appendChild(delBtn);
+
+      node.appendChild(row);
+
+      if (isObj) {
+        const body = el('div', {}, { marginLeft:'8px' });
+        toggle.onclick = () => { body.style.display = body.style.display === 'none' ? 'block' : 'none'; toggle.textContent = body.style.display === 'none' ? '▸' : '▾'; };
+        if (Array.isArray(value)) value.forEach((v,i) => body.appendChild(buildNode(i, v, path.concat(key))));
+        else Object.keys(value).forEach(k => body.appendChild(buildNode(k, value[k], path.concat(key))));
+        node.appendChild(body);
+      }
+      return node;
+    }
+
+    function rerender() {
+      container.innerHTML = '';
+      const header = el('div', { textContent: '(root)' }, { fontWeight:700, marginBottom:'6px' });
+      container.appendChild(header);
+      if (root.data && typeof root.data === 'object') {
+        Object.keys(root.data).forEach(k => container.appendChild(buildNode(k, root.data[k], [])));
+      } else {
+        const t = el('textarea', { value: JSON.stringify(root.data, null, 2) }, { width:'100%', height:'140px', background:'#111', color:'#cfc' });
+        t.onchange = () => { try { root.data = JSON.parse(t.value); } catch {} };
+        container.appendChild(t);
+      }
+    }
+
+    function setData(v) { root.data = v; rerender(); }
+    function getEdited() { return root.data; }
+    rerender();
+    return { container, getEdited, setData, rerender };
+  }
+
+  /* ========================
+     REPLAY ENGINE (simple)
+     ======================== */
+  async function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
+  async function replayMessages(entries=[], opts={ delay:150, loop:false, socket:null }) {
+    if (!opts.socket) throw new Error('socket required for replay');
+    do {
+      for (const e of entries) {
+        try {
+          const payload = (e.__payloadBytes__) ? e.__payloadBytes__ : (e.obj ? JSON.stringify(e.obj) : e.raw || e.decodedText || e.message);
+          if (payload instanceof Uint8Array || payload instanceof ArrayBuffer) opts.socket.send(payload);
+          else opts.socket.send(payload);
+        } catch (err) { console.warn('replay err',err); }
+        await sleep(opts.delay || 150);
+      }
+    } while(opts.loop);
+  }
+
+  /* ========================
+     LOG / CLONE DATA MODEL
+     ======================== */
+  LOGS.requests = LOGS.requests || [];
+  LOGS.messages = LOGS.messages || [];
+
+  function pushRequestLog(entry) {
+    entry.id = uid('req'); entry.ts = nowIso();
+    LOGS.requests.push(entry);
+    if (LOGS.requests.length > (SETTINGS.maxLogs || DEFAULTS.maxLogs)) LOGS.requests.shift();
+    persistAll();
+    if (currentTab === 'logs') renderTab();
+  }
+  function pushMessageLog(entry) {
+    entry.id = uid('msg'); entry.ts = nowIso();
+    LOGS.messages.push(entry);
+    if (LOGS.messages.length > (SETTINGS.maxMessages || DEFAULTS.maxMessages)) LOGS.messages.shift();
+    persistAll();
+    if (currentTab === 'logs') renderTab();
+  }
+
+  /* ========================
+     Build Modified (Sparse Overlay Merge)
+     - only override ticked paths from clone.data; everything else inherits from intercepted
+     ======================== */
+  function buildModified(intercepted, clone) {
+    const edited = clone.data || {};
+    const ticks = clone.ticks || {};
+    // deep clone intercepted
+    let result;
+    try { result = JSON.parse(JSON.stringify(intercepted)); } catch { result = Object.assign({}, intercepted); }
+    for (const path in ticks) {
+      if (!ticks[path]) continue;
+      const parts = path.split('.');
+      // find override value inside clone.data (edited)
+      let src = edited;
+      let ok = true;
+      for (const p of parts) {
+        if (src && typeof src === 'object' && p in src) src = src[p];
+        else { ok = false; break; }
+      }
+      if (!ok) continue;
+      // navigate result and assign
+      let dst = result;
+      for (let i = 0; i < parts.length - 1; i++) {
+        const p = parts[i];
+        if (!(p in dst) || typeof dst[p] !== 'object') dst[p] = {};
+        dst = dst[p];
+      }
+      const last = parts[parts.length - 1];
+      dst[last] = src;
+    }
+    return result;
+  }
+
+  /* ========================
+     MATCH & UTILITIES
+     ======================== */
+  function matchesClone(url, clone) {
+    if (!clone || !clone.targetUrl) return false;
+    switch (clone.matchMode) {
+      case 'exact': return url === clone.targetUrl;
+      case 'prefix': return String(url).startsWith(clone.targetUrl);
+      case 'regex':
+      default:
+        try { return new RegExp(clone.targetUrl).test(String(url)); } catch { return false; }
+    }
+  }
+
+  /* ========================
+     Interceptors: XHR / fetch / WebSocket / postMessage
+     ======================== */
+  const Native = { fetch: window.fetch, XHR: window.XMLHttpRequest, WS: window.WebSocket, postMessage: window.postMessage };
+
+  // XHR: override send to allow in-place replacement (we call OrigSend on same instance with revived body)
+  if (Native.XHR) {
+    const OrigOpen = Native.XHR.prototype.open;
+    const OrigSend = Native.XHR.prototype.send;
+    const OrigSetHeader = Native.XHR.prototype.setRequestHeader;
+
+    Native.XHR.prototype.open = function (method, url, ...rest) {
+      try { this._nc_method = method; this._nc_url = String(url); this._nc_headers = {}; } catch {}
+      return OrigOpen.call(this, method, url, ...rest);
+    };
+    Native.XHR.prototype.setRequestHeader = function (k, v) {
+      try { this._nc_headers = this._nc_headers || {}; this._nc_headers[k] = v; } catch {}
+      return OrigSetHeader.call(this, k, v);
+    };
+    Native.XHR.prototype.send = function (body) {
+      try {
+        const entry = { kind:'xhr', url:this._nc_url, method:this._nc_method||'GET', headers: this._nc_headers||{}, body: safeClone(body) };
+        pushRequestLog(entry);
+        // Find enabled autoReplace clone
+        for (const clone of CLONES) {
+          if (!clone.enabled || !clone.autoReplace) continue;
+          if (clone.kind !== 'xhr' && clone.kind !== 'fetch') continue;
+          if (!matchesClone(entry.url, clone)) continue;
+          // Build modified object merging ticks => modified contains method,url,headers,body
+          const modified = buildModified(entry, clone);
+          // Revive placeholders
+          const revivedBody = revivePlaceholders(modified.body || (modified.data && modified.data.body) || null);
+          const revivedHeaders = modified.headers || (modified.data && modified.data.headers) || {};
+          // Apply headers on this same XHR instance
+          try {
+            // set request headers present in revivedHeaders
+            for (const hk in revivedHeaders) {
+              try { OrigSetHeader.call(this, hk, revivedHeaders[hk]); } catch {}
+            }
+          } catch (e) {}
+          // send using same XHR instance with modified body (replace original)
+          try {
+            return OrigSend.call(this, revivedBody === undefined ? null : revivedBody);
+          } catch (e) {
+            console.warn('auto xhr send failed', e);
+            return OrigSend.call(this, body);
+          }
+        }
+      } catch (e) { console.warn('xhr intercept error', e); }
+      return OrigSend.call(this, body);
+    };
+  }
+
+  // fetch: return modified fetch if matched (replace original); otherwise call native
+  if (Native.fetch) {
+    window.fetch = async function (input, init) {
+      try {
+        const url = (typeof input === 'string' || input instanceof URL) ? String(input) : (input && input.url) || '';
+        const method = (init && init.method) || (input && input.method) || 'GET';
+        const headers = (init && init.headers) || {};
+        let bodyClone = null;
+        try {
+          if (init && init.body) {
+            if (typeof init.body === 'string') bodyClone = init.body;
+            else bodyClone = safeClone(init.body);
+          } else if (input && input instanceof Request) {
+            try { bodyClone = await input.clone().text(); } catch {}
+          }
+        } catch {}
+        const entry = { kind:'fetch', url, method, headers: safeClone(headers), body: safeClone(bodyClone) };
+        pushRequestLog(entry);
+
+        for (const clone of CLONES) {
+          if (!clone.enabled || !clone.autoReplace) continue;
+          if (clone.kind !== 'fetch' && clone.kind !== 'xhr') continue;
+          if (!matchesClone(url, clone)) continue;
+          const modified = buildModified(entry, clone);
+          const revived = revivePlaceholders(modified.data || modified);
+          try {
+            const opts = revived.opts || { method: revived.method || method, headers: revived.headers || headers, body: revived.body || null };
+            return Native.fetch(revived.url || url, opts);
+          } catch (e) { console.warn('auto fetch send failed', e); return Native.fetch(input, init); }
+        }
+      } catch (e) { console.warn('fetch intercept error', e); }
+      return Native.fetch(input, init);
+    };
+  }
+
+  // WebSocket: wrap constructor to intercept sends & messages; allow autoReplace for outgoing sends
+  if (Native.WS) {
+    const OrigWS = Native.WS;
+    function WrappedWS(url, protocols) {
+      const ws = protocols ? new OrigWS(url, protocols) : new OrigWS(url);
+      try {
+        ws.__nc_id = uid('ws'); ws.__nc_url = url;
+        const origSend = ws.send.bind(ws);
+        ws.send = function (data) {
+          try {
+            const preview = (typeof data === 'string') ? data.slice(0, 2000) : `[binary ${data && data.byteLength ? data.byteLength : '?'}]`;
+            pushMessageLog({ kind:'ws', direction:'out', socketId: ws.__nc_id, socketUrl: url, raw: preview, full: safeClone(data) });
+            for (const clone of CLONES) {
+              if (!clone.enabled || !clone.autoReplace) continue;
+              if (clone.kind !== 'ws') continue;
+              if (!matchesClone(url, clone)) continue;
+              const intercepted = { message: (typeof data === 'string') ? data : data };
+              const modified = buildModified(intercepted, clone);
+              const revived = revivePlaceholders(modified.data || modified);
+              const payload = revived.message || revived;
+              origSend(payload);
+              pushMessageLog({ kind:'ws', direction:'out', socketId: ws.__nc_id, socketUrl: url, note:'auto-replaced/send', raw: (typeof payload === 'string' ? payload.slice(0,2000) : '[binary]') });
+              return; // replaced original send
+            }
+          } catch (e) { console.warn('ws send intercept', e); }
+          return origSend(data);
+        };
+
+        // addEventListener wrapper to capture incoming messages and pass-through
+        const origAddEv = ws.addEventListener.bind(ws);
+        ws.addEventListener = function (type, listener, ...rest) {
+          if (type === 'message') {
+            const wrapped = function (ev) {
+              try {
+                const raw = ev.data;
+                let decoded = null;
+                if (isString(raw)) {
+                  let j = safeJSONParse(raw);
+                  decoded = { decodedText: raw, obj: j };
+                } else decoded = { decodedText: '[binary]', obj: null };
+                pushMessageLog({ kind:'ws', direction:'in', socketId: ws.__nc_id, socketUrl: url, raw: decoded.decodedText, obj: decoded.obj, full: safeClone(raw) });
+              } catch (e) { console.warn('ws in capture', e); }
+              try { return listener.call(this, ev); } catch (err) { console.warn('listener threw', err); }
+            };
+            return origAddEv(type, wrapped, ...rest);
+          }
+          return origAddEv(type, listener, ...rest);
+        };
+      } catch (e) {}
+      return ws;
+    }
+    WrappedWS.prototype = OrigWS.prototype;
+    window.WebSocket = WrappedWS;
+  }
+
+  // postMessage: intercept outgoing messages, allow autoReplace if clone.kind === 'pm'
+  (function patchPostMessage() {
+    try {
+      const orig = Native.postMessage;
+      window.postMessage = new Proxy(orig, {
+        apply(target, thisArg, args) {
+          try {
+            const msg = args[0];
+            pushMessageLog({ kind:'pm', direction:'out', raw: safeClone(msg) });
+            for (const clone of CLONES) {
+              if (!clone.enabled || !clone.autoReplace) continue;
+              if (clone.kind !== 'pm') continue;
+              // apply ticks/merge
+              const modified = buildModified({ message: msg }, clone);
+              const revived = revivePlaceholders(modified.data || modified);
+              return target.apply(thisArg, [revived.message || revived, ...args.slice(1)]);
+            }
+          } catch (e) { console.warn('postMessage capture', e); }
+          return target.apply(thisArg, args);
+        }
+      });
+    } catch (e) {}
+  })();
+
+  /* ========================
+     UI Render Functions (Logs / Clones / Editor / Replay / Settings)
+     ======================== */
+  function renderTab() {
+    if (currentTab === 'logs') return renderLogsTab();
+    if (currentTab === 'clones') return renderClonesTab();
+    if (currentTab === 'editor') return renderEditorTab();
+    if (currentTab === 'replay') return renderReplayTab();
+    if (currentTab === 'settings') return renderSettingsTab();
+  }
+
+  function renderLogsTab() {
+    contentEl.innerHTML = '';
+    const controls = document.createElement('div'); controls.style.display='flex'; controls.style.gap='8px';
+    const clearBtn = document.createElement('button'); clearBtn.textContent='Clear Logs'; clearBtn.className='nc-mini-btn';
+    const importBtn = document.createElement('button'); importBtn.textContent='Import'; importBtn.className='nc-mini-btn';
+    const exportBtn = document.createElement('button'); exportBtn.textContent='Export'; exportBtn.className='nc-mini-btn';
+    controls.appendChild(clearBtn); controls.appendChild(importBtn); controls.appendChild(exportBtn);
+    contentEl.appendChild(controls);
+
+    clearBtn.onclick = ()=>{ if(confirm('Clear logs?')){ LOGS.requests=[]; LOGS.messages=[]; persistAll(); renderLogsTab(); } };
+    importBtn.onclick = ()=>{ const f = document.createElement('input'); f.type='file'; f.accept='application/json'; f.onchange= async ()=>{ const file=f.files[0]; if(!file) return; try{ const txt=await file.text(); const data=JSON.parse(txt); if(data.LOGS) LOGS=data.LOGS; if(data.CLONES) CLONES=data.CLONES; persistAll(); renderTab(); alert('Imported'); }catch(e){alert('Import failed:'+String(e));}}; f.click(); };
+    exportBtn.onclick = ()=>{ const blob = new Blob([JSON.stringify({LOGS,CLONES,SETTINGS},null,2)],{type:'application/json'}); const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='nc-export.json'; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),3e3); };
+
+    const wrap = document.createElement('div'); wrap.style.marginTop='8px';
+    const reqH = document.createElement('div'); reqH.textContent='Requests (fetch/xhr)'; reqH.style.fontWeight='700'; wrap.appendChild(reqH);
+    for (let i = LOGS.requests.length-1; i>=0; i--) {
+      const r = LOGS.requests[i];
+      const it = document.createElement('div'); it.className='list-item';
+      it.innerHTML = `<div style="font-weight:700">${r.method||''} ${r.url||''}</div><div class="nc-pre">${JSON.stringify(r.body||r.headers||{},null,2)}</div>`;
+      it.onclick = ()=> openRequestDetail(r);
+      wrap.appendChild(it);
+    }
+    const msgH = document.createElement('div'); msgH.textContent='Messages (WS/postMessage)'; msgH.style.fontWeight='700'; msgH.style.marginTop='12px'; wrap.appendChild(msgH);
+    for (let i = LOGS.messages.length-1; i>=0; i--) {
+      const m = LOGS.messages[i];
+      const it = document.createElement('div'); it.className='list-item';
+      it.innerHTML = `<div style="font-weight:700">${m.kind||m.direction||'msg'} ${m.socketUrl||''}</div><div class="nc-pre">${(m.raw && typeof m.raw==='string') ? m.raw.slice(0,2000) : JSON.stringify(m.obj||m.raw||{},null,2)}</div>`;
+      it.onclick = ()=> openMessageDetail(m);
+      wrap.appendChild(it);
+    }
+    contentEl.appendChild(wrap);
+  }
+
+  function openRequestDetail(r) {
+    const modal = document.createElement('div'); modal.style.padding='8px'; modal.style.background='#070707'; modal.style.border='1px solid #222';
+    modal.innerHTML = `<div style="font-weight:700">${r.method||''} ${r.url||''}</div>`;
+    const pre = document.createElement('pre'); pre.className='nc-pre'; pre.textContent = JSON.stringify(r,null,2);
+    modal.appendChild(pre);
+    const saveBtn = document.createElement('button'); saveBtn.className='nc-mini-btn'; saveBtn.textContent='Save as Clone';
+    saveBtn.onclick = ()=>{ const c = newCloneFromLog(r); CLONES.unshift(c); persistAll(); renderTab(); alert('Saved clone: '+c.name); };
+    const closeBtn = document.createElement('button'); closeBtn.className='nc-mini-btn'; closeBtn.style.marginLeft='8px'; closeBtn.textContent='Close'; closeBtn.onclick = ()=> renderTab();
+    modal.appendChild(saveBtn); modal.appendChild(closeBtn);
+    contentEl.innerHTML=''; contentEl.appendChild(modal);
+  }
+
+  function openMessageDetail(m) {
+    const modal = document.createElement('div'); modal.style.padding='8px'; modal.style.background='#070707'; modal.style.border='1px solid #222';
+    modal.innerHTML = `<div style="font-weight:700">Message ${m.socketUrl||''}</div>`;
+    const pre = document.createElement('pre'); pre.className='nc-pre'; pre.textContent = JSON.stringify(m,null,2);
+    modal.appendChild(pre);
+    const saveBtn = document.createElement('button'); saveBtn.className='nc-mini-btn'; saveBtn.textContent='Save as Clone';
+    saveBtn.onclick = ()=> { const c = newCloneFromLog(m); CLONES.unshift(c); persistAll(); renderTab(); alert('Saved clone: '+c.name); };
+    const closeBtn = document.createElement('button'); closeBtn.className='nc-mini-btn'; closeBtn.style.marginLeft='8px'; closeBtn.textContent='Close'; closeBtn.onclick = ()=> renderTab();
+    modal.appendChild(saveBtn); modal.appendChild(closeBtn);
+    contentEl.innerHTML=''; contentEl.appendChild(modal);
+  }
+
+  function renderClonesTab() {
+    contentEl.innerHTML = '';
+    const controls = document.createElement('div'); controls.style.display='flex'; controls.style.gap='8px';
+    const newBtn = document.createElement('button'); newBtn.className='nc-mini-btn'; newBtn.textContent='New Clone';
+    const importBtn = document.createElement('button'); importBtn.className='nc-mini-btn'; importBtn.textContent='Import';
+    const exportBtn = document.createElement('button'); exportBtn.className='nc-mini-btn'; exportBtn.textContent='Export';
+    controls.appendChild(newBtn); controls.appendChild(importBtn); controls.appendChild(exportBtn);
+    contentEl.appendChild(controls);
+
+    newBtn.onclick = ()=> { const c = { id: uid('clone'), name:'Clone '+(CLONES.length+1), enabled:true, autoReplace:false, matchMode:'regex', targetUrl:'', kind:'fetch', data:{ method:'GET', url:'', headers:{}, body:null }, ticks:{} }; CLONES.unshift(c); persistAll(); renderTab(); };
+    importBtn.onclick = ()=> { const f=document.createElement('input'); f.type='file'; f.accept='application/json'; f.onchange=async()=>{ const file=f.files[0]; if(!file) return; try{ const txt=await file.text(); const arr=JSON.parse(txt); if(Array.isArray(arr)){ CLONES=arr.concat(CLONES); persistAll(); renderTab(); alert('Imported'); } else alert('Invalid file'); }catch(e){ alert('Import failed: '+String(e)); } }; f.click(); };
+    exportBtn.onclick = ()=> { const blob = new Blob([JSON.stringify(CLONES,null,2)],{type:'application/json'}); const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='nc-clones.json'; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),3e3); };
+
+    const list = document.createElement('div'); list.style.marginTop='8px';
+    CLONES.forEach((c, idx) => {
+      const it = document.createElement('div'); it.className='list-item';
+      it.innerHTML = `<div style="font-weight:700">${c.name} ${c.enabled? '': '[disabled]'} ${c.autoReplace? '[auto]':''}</div><div>${c.kind} | ${c.matchMode} | ${c.targetUrl||''}</div>`;
+      it.onclick = ()=> openCloneEditor(c, idx);
+      list.appendChild(it);
+    });
+    contentEl.appendChild(list);
+  }
+
+  function openCloneEditor(clone, idx) {
+    contentEl.innerHTML = '';
+    const wrapper = document.createElement('div');
+    const title = document.createElement('div'); title.style.fontWeight='700'; title.textContent='Edit Clone';
+    wrapper.appendChild(title);
+
+    const form = document.createElement('div'); form.style.display='flex'; form.style.flexDirection='column'; form.style.gap='8px'; form.style.marginTop='8px';
+    const nameIn = document.createElement('input'); nameIn.value = clone.name; form.appendChild(nameIn);
+    const enabledCb = document.createElement('label'); enabledCb.innerHTML = `<input type="checkbox" ${clone.enabled?'checked':''}/> enabled`; form.appendChild(enabledCb);
+    const autoCb = document.createElement('label'); autoCb.innerHTML = `<input type="checkbox" ${clone.autoReplace?'checked':''}/> autoReplace`; form.appendChild(autoCb);
+    const kindSel = document.createElement('select'); ['fetch','xhr','ws','pm'].forEach(k=>{ const o=document.createElement('option'); o.value=k; o.textContent=k; if(k===clone.kind) o.selected=true; kindSel.appendChild(o); }); form.appendChild(kindSel);
+    const matchSel = document.createElement('select'); ['regex','exact','prefix'].forEach(m=>{ const o=document.createElement('option'); o.value=m; o.textContent=m; if(m===clone.matchMode) o.selected=true; matchSel.appendChild(o); }); form.appendChild(matchSel);
+    const targetIn = document.createElement('input'); targetIn.placeholder='targetUrl (regex or literal)'; targetIn.value = clone.targetUrl || ''; form.appendChild(targetIn);
+    wrapper.appendChild(form);
+
+    const dataTitle = document.createElement('div'); dataTitle.style.fontWeight='700'; dataTitle.style.marginTop='8px'; dataTitle.textContent='Payload / Data';
+    wrapper.appendChild(dataTitle);
+    const editor = createJsonTreeEditor(clone.data || {});
+    wrapper.appendChild(editor.container);
+
+    // ticks area
+    const ticksTitle = document.createElement('div'); ticksTitle.style.marginTop='8px'; ticksTitle.textContent='Ticks (which keys to override on autoReplace)';
+    wrapper.appendChild(ticksTitle);
+    const ticksWrap = document.createElement('div'); ticksWrap.style.border='1px dashed #222'; ticksWrap.style.padding='8px'; wrapper.appendChild(ticksWrap);
+
+    function populateTicks() {
+      ticksWrap.innerHTML = '';
+      function walk(obj,prefix='') {
+        if (obj && typeof obj === 'object' && !obj.__placeholder) {
+          for (const k in obj) {
+            const p = prefix ? (prefix + '.' + k) : k;
+            const row = document.createElement('div');
+            const cb = document.createElement('input'); cb.type='checkbox'; cb.checked = !!clone.ticks[p];
+            cb.onchange = ()=>{ clone.ticks[p] = cb.checked; };
+            row.appendChild(cb);
+            const lbl = document.createElement('span'); lbl.textContent = ' ' + p + ' : ' + (typeof obj[k] === 'object' ? (Array.isArray(obj[k]) ? 'Array' : 'Object') : String(obj[k])); row.appendChild(lbl);
+            ticksWrap.appendChild(row);
+            if (typeof obj[k] === 'object' && obj[k] !== null) walk(obj[k], p);
+          }
+        }
+      }
+      walk(editor.getEdited());
+    }
+    populateTicks();
+
+    const btnRow = document.createElement('div'); btnRow.style.marginTop='8px';
+    const saveBtn = document.createElement('button'); saveBtn.className='nc-mini-btn'; saveBtn.textContent='Save';
+    const cancelBtn = document.createElement('button'); cancelBtn.className='nc-mini-btn'; cancelBtn.style.marginLeft='8px'; cancelBtn.textContent='Cancel';
+    const deleteBtn = document.createElement('button'); deleteBtn.className='nc-mini-btn'; deleteBtn.style.marginLeft='8px'; deleteBtn.style.background='#7a1a1a'; deleteBtn.textContent='Delete';
+    btnRow.appendChild(saveBtn); btnRow.appendChild(cancelBtn); btnRow.appendChild(deleteBtn);
+    wrapper.appendChild(btnRow);
+
+    saveBtn.onclick = async () => {
+      clone.name = nameIn.value || clone.name;
+      clone.enabled = enabledCb.querySelector('input').checked;
+      clone.autoReplace = autoCb.querySelector('input').checked;
+      clone.kind = kindSel.value;
+      clone.matchMode = matchSel.value;
+      clone.targetUrl = targetIn.value;
+      clone.data = editor.getEdited();
+      CLONES.splice(idx,1,clone);
+      persistAll();
+      alert('Saved');
+      renderTab();
+    };
+    cancelBtn.onclick = () => renderTab();
+    deleteBtn.onclick = () => { if(!confirm('Delete clone?')) return; CLONES.splice(idx,1); persistAll(); renderTab(); };
+
+    contentEl.innerHTML = ''; contentEl.appendChild(wrapper);
+  }
+
+  function renderEditorTab() {
+    contentEl.innerHTML = '<div>Editor: select a clone in the Clones tab to edit its payload</div>';
+  }
+
+  function renderReplayTab() {
+    contentEl.innerHTML = '';
+    const info = document.createElement('div'); info.textContent = 'Replay: pick WS messages from Logs to build a replay list (provide ws url below)';
+    contentEl.appendChild(info);
+    const list = document.createElement('div'); list.style.marginTop='8px';
+    const msgs = LOGS.messages.filter(m=>m.kind==='ws');
+    const selected = [];
+    msgs.forEach((m,i)=> {
+      const item = document.createElement('div'); item.className='list-item';
+      item.innerHTML = `<div style="font-weight:700">${m.socketUrl||m.socketId||''} ${m.direction||''}</div><div class="nc-pre">${(m.obj?JSON.stringify(m.obj,null,2):m.raw)||''}</div>`;
+      const cb = document.createElement('input'); cb.type='checkbox'; cb.style.marginRight='8px';
+      cb.onchange = ()=> { if(cb.checked) selected.push(m); else { const idx=selected.indexOf(m); if(idx>=0) selected.splice(idx,1); } };
+      item.prepend(cb);
+      list.appendChild(item);
+    });
+    contentEl.appendChild(list);
+    const socketUrlInput = document.createElement('input'); socketUrlInput.placeholder='ws socket url to open for replay (or leave blank to reuse existing)'; socketUrlInput.style.width='100%'; socketUrlInput.style.marginTop='8px';
+    contentEl.appendChild(socketUrlInput);
+    const playBtn = document.createElement('button'); playBtn.className='nc-mini-btn'; playBtn.textContent='Start Replay'; playBtn.style.marginTop='8px';
+    playBtn.onclick = async () => {
+      let ws;
+      if (socketUrlInput.value) {
+        try { ws = new WebSocket(socketUrlInput.value); await new Promise(r=>ws.addEventListener('open',r)); } catch (e) { return alert('open failed: '+String(e)); }
+      } else {
+        return alert('Please provide ws url to replay to.');
+      }
+      replayMessages(selected, { delay: 200, loop: false, socket: ws }).catch(e=>console.warn(e));
+    };
+    contentEl.appendChild(playBtn);
+  }
+
+  function renderSettingsTab() {
+    contentEl.innerHTML = '';
+    const wrapper = document.createElement('div'); wrapper.style.display='flex'; wrapper.style.flexDirection='column'; wrapper.style.gap='8px';
+    const maxLogsIn = document.createElement('input'); maxLogsIn.value = SETTINGS.maxLogs || DEFAULTS.maxLogs;
+    const sizeIn = document.createElement('input'); sizeIn.value = SETTINGS.sizeLimitKB || DEFAULTS.sizeLimitKB;
+    const saveBtn = document.createElement('button'); saveBtn.className='nc-mini-btn'; saveBtn.textContent='Save';
+    wrapper.appendChild(document.createTextNode('maxLogs')); wrapper.appendChild(maxLogsIn);
+    wrapper.appendChild(document.createTextNode('sizeLimitKB (for file persistence)')); wrapper.appendChild(sizeIn);
+    wrapper.appendChild(saveBtn);
+    saveBtn.onclick = () => { SETTINGS.maxLogs = parseInt(maxLogsIn.value) || DEFAULTS.maxLogs; SETTINGS.sizeLimitKB = parseInt(sizeIn.value) || DEFAULTS.sizeLimitKB; persistAll(); alert('Saved'); };
+    contentEl.appendChild(wrapper);
+  }
+
+  // initial render variables (panel and contentEl are created earlier)
+  const panelEl = document.getElementById(PANEL_ID);
+  const contentEl = document.getElementById('nc_content');
+  let currentTab = 'logs';
+  renderTab();
+
+  /* ========================
+     Helper: create clone from log entry
+     ======================== */
+  function newCloneFromLog(log) {
+    const c = { id: uid('clone'), name: 'Clone ' + (CLONES.length+1), enabled:true, autoReplace:false, matchMode:'regex', targetUrl:'', kind:'fetch', data:{}, ticks:{} };
+    if (log.kind === 'xhr' || log.kind === 'fetch') {
+      c.kind = 'fetch'; c.targetUrl = log.url || ''; c.data = { method: log.method||'GET', url: log.url, headers: log.headers||{}, body: log.body||null };
+    } else if (log.kind === 'ws') {
+      c.kind = 'ws'; c.targetUrl = log.socketUrl || ''; c.data = { message: log.obj || log.decodedText || log.raw || null };
+    } else if (log.kind === 'pm') {
+      c.kind = 'pm'; c.data = { message: log.raw || null };
+    }
+    return c;
+  }
+
+  /* ========================
+     Auto Open throttle
+     ======================== */
+  let lastAutoOpen = 0;
+  function autoOpen() {
+    const now = Date.now();
+    if (now - lastAutoOpen > DEFAULTS.autoOpenThrottleMs) {
+      panelEl.classList.add('open'); lastAutoOpen = now;
+    }
+  }
+
+  // ensure persisted load
+  persistAll();
+
+  /* ========================
+     ARC - Auto Rain Claim Module (integrated)
+     - STOMP parse & wrapper detection
+     - auto-send SEND frame to claim with configurable delay & toggle (UI supports)
+     ======================== */
+  (function AutoRainClaimModule() {
+    if (window.__ARC_INTEGRATED__) return;
+    window.__ARC_INTEGRATED__ = true;
+
+    const ARC = SETTINGS.arc || DEFAULTS.arc;
+    const claimed = new Map();
+    const pending = new Map();
+    const recentClaims = new Map();
+
+    function nowTs(){ return Date.now(); }
+    function isSockJSWrapped(str) { if (!isString(str)) return false; const s=str.trim(); return s.startsWith('a[') || s.startsWith('["'); }
+    function unwrapSockJS(str) {
+      try {
+        const jsonish = str.trim().startsWith('a[') ? str.trim().slice(1) : str;
+        const arr = JSON.parse(jsonish);
+        if (Array.isArray(arr)) return arr.join('');
+        return String(arr);
+      } catch (e) {
+        const m = str.match(/a\[(?:\"|')(.*)(?:\"|')\]/s);
+        if (m && m[1]) return m[1].replace(/\\"/g,'"');
+        return str;
+      }
+    }
+    function wrapSockJS(frame) { return 'a[' + JSON.stringify(frame) + ']'; }
+    function endsWithNullChar(s) { return isString(s) && s.charCodeAt(s.length-1) === 0; }
+
+    function parseStompFrame(frameText) {
+      if (!isString(frameText)) return null;
+      let txt = frameText.replace(/\r/g,'');
+      if (endsWithNullChar(txt)) txt = txt.slice(0,-1);
+      const firstNl = txt.indexOf('\n');
+      if (firstNl === -1) return null;
+      const command = txt.slice(0, firstNl).trim();
+      const rest = txt.slice(firstNl+1);
+      const splitIndex = rest.indexOf('\n\n');
+      const headerPart = splitIndex >= 0 ? rest.slice(0, splitIndex) : '';
+      const bodyPart = splitIndex >= 0 ? rest.slice(splitIndex+2) : '';
+      const headers = {};
+      if (headerPart) {
+        const lines = headerPart.split('\n');
+        for (const line of lines) {
+          const idx = line.indexOf(':');
+          if (idx >= 0) { const k = line.slice(0,idx).trim(); const v = line.slice(idx+1).trim(); headers[k]=v; }
+        }
+      }
+      return { command, headers, body: bodyPart, raw: frameText };
+    }
+
+    function tryParseJson(txt) { try { return JSON.parse(txt); } catch { return null; } }
+
+    function isRainAnnouncement(frame) {
+      if (!frame || frame.command !== 'MESSAGE') return false;
+      const dest = frame.headers && frame.headers.destination;
+      if (!dest || dest.indexOf('/user/queue/chat.message.add') === -1) return false;
+      const json = tryParseJson(frame.body);
+      if (!json) return false;
+      if (json.type && String(json.type).toUpperCase() === 'RAIN') {
+        const ri = json.rainInfo || json.rain || null;
+        if (ri && (ri.isCanClaim === true || ri.isCanClaim === 'true' || ri.isCanClaim === 1)) {
+          return { rainId: ri.id || ri.rainId || json.id || null, payload: json, frame };
+        }
+      }
+      if (json.rainInfo && json.rainInfo.isCanClaim) return { rainId: json.rainInfo.id || null, payload: json, frame };
+      return false;
+    }
+
+    function isClaimConfirmation(frame) {
+      if (!frame || frame.command !== 'MESSAGE') return false;
+      const dest = frame.headers && frame.headers.destination;
+      if (!dest) return false;
+      if (dest.indexOf('/user/queue/chat.rain.claim') === -1) return false;
+      const json = tryParseJson(frame.body);
+      if (!json) return false;
+      if ('rainId' in json) {
+        if (json.isMe === true || json.isMe === 'true') return { rainId: json.rainId, payload: json };
+      }
+      return false;
+    }
+
+    function sendClaimFrame(ws, rainId, wrapperMode) {
+      if (!ws || ws.readyState !== 1) return false;
+      const body = JSON.stringify({ rainId: rainId });
+      const frame = [
+        'SEND',
+        'destination:/app/chat.rain.claim',
+        'content-type:application/json',
+        'content-length:' + (new TextEncoder().encode(body).length),
+        '',
+        body + '\u0000'
+      ].join('\n');
+      try {
+        const payload = wrapperMode ? wrapSockJS(frame) : frame;
+        ws.send(payload);
+        return true;
+      } catch (e) { console.warn('ARC sendClaimFrame error', e); return false; }
+    }
+
+    function attemptClaim(ws, rainId, wrapperMode) {
+      if (!SETTINGS.arc || !SETTINGS.arc.enabled) return;
+      if (!rainId) return;
+      if (claimed.has(String(rainId))) return;
+      if (pending.has(String(rainId))) return;
+      const last = recentClaims.get(String(rainId));
+      if (last && (nowTs() - last) < (SETTINGS.arc?.dedupeMemoryMs || DEFAULTS.arc.dedupeMemoryMs)) return;
+      const state = { attempts:0, ws, wrapperMode, rainId, timerId:null };
+      pending.set(String(rainId), state);
+
+      function cleanup() {
+        const s = pending.get(String(rainId));
+        if (!s) return;
+        if (s.timerId) clearTimeout(s.timerId);
+        pending.delete(String(rainId));
+        claimed.set(String(rainId), nowTs());
+        setTimeout(()=>{ claimed.delete(String(rainId)); }, (SETTINGS.arc?.dedupeMemoryMs||DEFAULTS.arc.dedupeMemoryMs)+1000);
+        recentClaims.set(String(rainId), nowTs());
+      }
+
+      async function doAttempt() {
+        if (claimed.has(String(rainId))) { cleanup(); return; }
+        state.attempts += 1;
+        // honor configured delay (randomization between 0..delay)
+        const cfgDelay = SETTINGS.arc?.delayMs ?? DEFAULTS.arc.delayMs;
+        const delay = (cfgDelay && cfgDelay>0) ? Math.floor(Math.random()*cfgDelay) : 0;
+        if (delay) await sleep(delay);
+        const ok = sendClaimFrame(ws, rainId, state.wrapperMode);
+        recentClaims.set(String(rainId), nowTs());
+        if (!ok) {
+          if (state.attempts < (SETTINGS.arc?.maxAttempts||DEFAULTS.arc.maxAttempts)) {
+            const wait = (SETTINGS.arc?.initialRetryMs||DEFAULTS.arc.initialRetryMs) * Math.pow(SETTINGS.arc?.retryFactor||DEFAULTS.arc.retryFactor, state.attempts-1);
+            state.timerId = setTimeout(doAttempt, wait);
+          } else {
+            pending.delete(String(rainId));
+          }
+          return;
+        }
+        // wait for confirmation, else retry
+        state.timerId = setTimeout(()=> {
+          if (pending.has(String(rainId))) {
+            if (state.attempts < (SETTINGS.arc?.maxAttempts||DEFAULTS.arc.maxAttempts)) {
+              const wait = (SETTINGS.arc?.initialRetryMs||DEFAULTS.arc.initialRetryMs) * Math.pow(SETTINGS.arc?.retryFactor||DEFAULTS.arc.retryFactor, state.attempts-1);
+              state.timerId = setTimeout(doAttempt, wait);
+            } else {
+              pending.delete(String(rainId));
+            }
+          }
+        }, SETTINGS.arc?.confirmTimeoutMs || DEFAULTS.arc.confirmTimeoutMs);
+      }
+
+      state.markConfirmed = cleanup;
+      doAttempt();
+    }
+
+    function confirmClaim(rainId) {
+      if (!rainId) return;
+      const pend = pending.get(String(rainId));
+      if (pend) {
+        if (pend.timerId) clearTimeout(pend.timerId);
+        pending.delete(String(rainId));
+      }
+      claimed.set(String(rainId), nowTs());
+      setTimeout(()=>{ claimed.delete(String(rainId)); }, (SETTINGS.arc?.dedupeMemoryMs||DEFAULTS.arc.dedupeMemoryMs)+1000);
+      recentClaims.set(String(rainId), nowTs());
+      console.log('[ARC] Rain claimed confirmed for', rainId);
+    }
+
+    // Patch WebSocket.prototype.addEventListener to inspect messages (idempotent)
+    (function patchWSMessageIntercept() {
+      if (!window.WebSocket || window.__ARC_WS_PATCHED__) return;
+      try {
+        const proto = window.WebSocket.prototype;
+        if (proto.__ARC_PATCHED__) return;
+        proto.__ARC_PATCHED__ = true;
+        const origAdd = proto.addEventListener;
+        proto.addEventListener = function(type, listener, ...rest) {
+          if (type === 'message') {
+            const wrapped = function(ev) {
+              try {
+                let raw = ev.data; let wrapperMode=false;
+                if (isString(raw) && isSockJSWrapped(raw)) { wrapperMode = true; raw = unwrapSockJS(raw); }
+                if (isString(raw)) {
+                  const stomp = parseStompFrame(raw);
+                  if (stomp) {
+                    const ra = isRainAnnouncement(stomp);
+                    if (ra) {
+                      try { attemptClaim(this, ra.rainId, wrapperMode); console.log('[ARC] Detected rain announcement', ra.rainId); } catch(e){console.warn(e);}
+                    }
+                    const conf = isClaimConfirmation(stomp);
+                    if (conf) confirmClaim(conf.rainId);
+                  } else {
+                    try {
+                      const maybe = raw.indexOf('{')>=0 ? tryParseJson(raw.slice(raw.indexOf('{'))) : null;
+                      if (maybe && maybe.type && String(maybe.type).toUpperCase()==='RAIN' && maybe.rainInfo && maybe.rainInfo.isCanClaim) {
+                        attemptClaim(this, maybe.rainInfo.id || maybe.id, false);
+                      }
+                    } catch(e){}
+                  }
+                }
+              } catch(e){ console.warn('[ARC] inspect error', e); }
+              try { return listener.call(this, ev); } catch(err){ console.warn('[ARC] listener threw', err); }
+            };
+            return origAdd.call(this, type, wrapped, ...rest);
+          }
+          return origAdd.call(this, type, listener, ...rest);
+        };
+        window.__ARC_WS_PATCHED__ = true;
+        console.log('[ARC] WebSocket message patch installed (Integrated)');
+      } catch (e) { console.warn('[ARC] failed to patch WebSocket messages', e); }
+    })();
+
+    // Also watch window.postMessage channel for rain announcements (non-WS)
+    window.addEventListener('message', function(ev) {
+      try {
+        const msg = ev.data;
+        if (msg && typeof msg === 'object' && msg.type && String(msg.type).toUpperCase()==='RAIN' && msg.rainInfo && msg.rainInfo.isCanClaim) {
+          const rid = msg.rainInfo.id || msg.id;
+          console.log('[ARC] window.message rain detected', rid);
+        }
+      } catch(e){}
+    });
+
+    // Expose manual API
+    window.__ARC = { attemptClaim, confirmClaim, pending, claimed, config: SETTINGS.arc };
+
+  })();
+
+  /* ========================
+     Final: expose some helpers and bind unload persistence
+     ======================== */
+  window.__NC = { CLONES, LOGS, SETTINGS, persistAll, buildModified };
+
+  window.addEventListener('beforeunload', persistAll);
+
+  console.log('[Network Control Integrated] Loaded. Use panel to manage clones and ARC.');
+
+})();
