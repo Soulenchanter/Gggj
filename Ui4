@@ -1,0 +1,398 @@
+/**
+ * Mini DevTools+ Mobile (Stealth Edition B)
+ * ------------------------------------------------------------
+ * Version: 2.0.0 (Medium Stealth)
+ * Author: mik
+ * License: mik
+ *
+ * This script provides:
+ *  - A mobile-friendly floating devtools panel
+ *  - WebSocket / XHR / Fetch / postMessage log interception
+ *  - Optional autorun snippets with iframe targeting
+ *  - Medium-stealth instrumentation
+ *
+ * Stealth Features:
+ *  - Native-preserving proxy wrappers
+ *  - Non-enumerable, non-configurable hooks
+ *  - Hidden function signatures via toString() cloning
+ *  - Prototype-safe replacements
+ *  - Low-detectability instrumentation
+ *
+ * Safe for GitHub storage and public use.
+ */
+
+(function () {
+  'use strict';
+
+  /* ============================================================
+   * Storage
+   * ============================================================ */
+  const SK = {
+    SN: "mcc_sn_v2",
+    POS: "mcc_btn_pos_v2"
+  };
+
+  let snippets = JSON.parse(localStorage.getItem(SK.SN) || "{}");
+  function saveSnips() {
+    localStorage.setItem(SK.SN, JSON.stringify(snippets));
+  }
+
+  /* ============================================================
+   * Logs + State
+   * ============================================================ */
+  const logs = { ws: [], xhr: [], pm: [] };
+  let activeTab = "WS";
+
+  /* ============================================================
+   * Floating Button
+   * ============================================================ */
+  const btn = document.createElement("div");
+  Object.assign(btn.style, {
+    position: "fixed",
+    left: "15px",
+    top: "60px",
+    width: "58px",
+    height: "58px",
+    background: "#101010",
+    color: "#fff",
+    borderRadius: "50%",
+    fontSize: "26px",
+    display: "flex",
+    justifyContent: "center",
+    alignItems: "center",
+    zIndex: 999999,
+    boxShadow: "0 0 12px #000",
+    touchAction: "none",
+    userSelect: "none"
+  });
+  btn.textContent = "≡";
+  document.body.appendChild(btn);
+
+  restoreBtn();
+
+  /* Drag */
+  (() => {
+    let sx, sy, sl, st, d = false;
+    btn.addEventListener("pointerdown", e => {
+      d = true; sx = e.clientX; sy = e.clientY;
+      sl = btn.offsetLeft; st = btn.offsetTop;
+      btn.setPointerCapture(e.pointerId);
+    });
+    btn.addEventListener("pointermove", e => {
+      if (!d) return;
+      btn.style.left = sl + (e.clientX - sx) + "px";
+      btn.style.top = st + (e.clientY - sy) + "px";
+    });
+    btn.addEventListener("pointerup", e => {
+      d = false;
+      btn.releasePointerCapture(e.pointerId);
+      saveBtn();
+    });
+  })();
+
+  function saveBtn() {
+    localStorage.setItem(SK.POS, JSON.stringify({
+      l: btn.style.left,
+      t: btn.style.top
+    }));
+  }
+  function restoreBtn() {
+    let d = JSON.parse(localStorage.getItem(SK.POS) || "null");
+    if (d) { btn.style.left = d.l; btn.style.top = d.t; }
+  }
+
+  /* ============================================================
+   * Panel
+   * ============================================================ */
+  const panel = document.createElement("div");
+  Object.assign(panel.style, {
+    position: "fixed",
+    top: "0",
+    right: "-85%",
+    width: "85%",
+    height: "100%",
+    background: "#111",
+    color: "#fff",
+    zIndex: 999998,
+    boxShadow: "0 0 15px #000",
+    display: "flex",
+    flexDirection: "column",
+    transition: "right .25s ease",
+    fontFamily: "monospace",
+    overflow: "hidden"
+  });
+  document.body.appendChild(panel);
+
+  let open = false;
+  btn.onclick = () => (open ? closeP() : openP());
+  const openP = () => { panel.style.right = "0"; open = true; };
+  const closeP = () => { panel.style.right = "-85%"; open = false; };
+
+  panel.innerHTML = `
+    <div style="background:#222;padding:12px;font-size:20px;
+      display:flex;justify-content:space-between;align-items:center;">
+      <span>Mini DevTools+</span>
+      <button id="mcc-x"
+        style="font-size:18px;background:#444;color:#fff;border:0;
+        padding:6px 14px;border-radius:6px;">X</button>
+    </div>
+
+    <div id="tabs" style="display:flex;gap:4px;padding:6px;background:#000;">
+      <button data-t="WS">WS</button>
+      <button data-t="XHR">XHR</button>
+      <button data-t="PM">Post</button>
+      <button data-t="SN">Snips</button>
+    </div>
+    <div id="cont" style="flex:1;overflow:auto;font-size:12px;padding:6px;"></div>
+  `;
+
+  panel.querySelector("#mcc-x").onclick = closeP;
+
+  const cont = panel.querySelector("#cont");
+  [...panel.querySelectorAll("#tabs button")].forEach(b => {
+    b.onclick = () => { activeTab = b.dataset.t; renderTab(); };
+  });
+
+  /* ============================================================
+   * Renderers
+   * ============================================================ */
+  function decode(v) {
+    try {
+      if (typeof v === "string") {
+        try { return JSON.stringify(JSON.parse(v), null, 2); }
+        catch { return v; }
+      }
+      if (v instanceof ArrayBuffer) {
+        let u = [...new Uint8Array(v).slice(0, 16)]
+          .map(x => x.toString(16)).join(" ");
+        return `[ArrayBuffer ${v.byteLength}] ${u}...`;
+      }
+      return JSON.stringify(v, null, 2);
+    } catch { return "[decode error]"; }
+  }
+
+  function renderTab() {
+    if (activeTab === "SN") return renderSnips();
+
+    const key = activeTab.toLowerCase();
+    const arr = logs[key];
+
+    cont.innerHTML = `<div style='color:#aaa;margin-bottom:4px;'>
+      ${arr.length} entries</div>`;
+
+    arr.forEach(e => {
+      let pre = document.createElement("pre");
+      Object.assign(pre.style, {
+        background: "#000",
+        padding: "6px",
+        marginBottom: "4px",
+        borderRadius: "6px",
+        whiteSpace: "pre-wrap"
+      });
+      pre.textContent = decode(e.data);
+      cont.appendChild(pre);
+    });
+  }
+
+  /* ============================================================
+   * Snippets
+   * ============================================================ */
+  function renderSnips() {
+    cont.innerHTML = `
+      <div style="display:flex;flex-direction:column;gap:6px;">
+        <textarea id="sc" rows="7"
+          style="width:100%;background:#000;color:#fff;"></textarea>
+        <input id="sn" placeholder="Name"
+          style="padding:8px;background:#000;color:#fff;border:1px solid #333;">
+        <select id="st"
+          style="padding:8px;background:#000;color:#fff;border:1px solid #333;"></select>
+        <select id="sa"
+          style="padding:8px;background:#000;color:#fff;border:1px solid #333;">
+          <option value="manual">manual</option>
+          <option value="load">load</option>
+          <option value="hook">hook</option>
+          <option value="always">always</option>
+        </select>
+        <button id="sv" style="padding:10px;background:#222;color:#fff;">Save</button>
+        <button id="rn" style="padding:10px;background:#444;color:#fff;">Run</button>
+      </div>
+    `;
+
+    const sc = cont.querySelector("#sc");
+    const sn = cont.querySelector("#sn");
+    const st = cont.querySelector("#st");
+    const sa = cont.querySelector("#sa");
+
+    const fr = frames();
+    fr.forEach((f, i) => {
+      let o = document.createElement("option");
+      o.value = i; o.textContent = f.label;
+      st.appendChild(o);
+    });
+
+    cont.querySelector("#sv").onclick = () => {
+      const n = sn.value.trim();
+      if (!n) return alert("Name?");
+      snippets[n] = {
+        code: sc.value,
+        autorun: sa.value,
+        target: parseInt(st.value)
+      };
+      saveSnips();
+      alert("Saved");
+    };
+
+    cont.querySelector("#rn").onclick = () => {
+      const n = sn.value.trim();
+      if (!snippets[n]) return alert("Not found");
+      runSnippet(snippets[n]);
+    };
+  }
+
+  function frames() {
+    const a = [{ win: window, label: "Top" }];
+    [...document.querySelectorAll("iframe")].forEach((f, i) => {
+      try {
+        a.push({ win: f.contentWindow, label: f.name || f.src || "iframe" + i });
+      } catch { }
+    });
+    return a;
+  }
+
+  function runSnippet(sp) {
+    try {
+      let fr = frames();
+      (fr[sp.target]?.win || window).eval(sp.code);
+    } catch (e) { console.warn(e); }
+  }
+
+  /* ============================================================
+   * Autorun
+   * ============================================================ */
+  window.addEventListener("load", () => {
+    Object.values(snippets).forEach(s => {
+      if (s.autorun === "load" || s.autorun === "always") runSnippet(s);
+    });
+  });
+
+  /* ============================================================
+   * STEALTH HOOK HELPERS
+   * ============================================================ */
+
+  /** Preserve native toString() for wrapped functions */
+  function cloneNativeSignature(src, tgt) {
+    try {
+      const ts = Function.prototype.toString;
+      Object.defineProperty(tgt, "toString", {
+        value: function () { return ts.call(src); },
+        configurable: false,
+        writable: false,
+        enumerable: false
+      });
+    } catch { }
+  }
+
+  /** Safe defineProperty wrapper */
+  function hideProp(obj, key, val) {
+    Object.defineProperty(obj, key, {
+      value: val,
+      configurable: false,
+      writable: false,
+      enumerable: false
+    });
+  }
+
+  /* ============================================================
+   * STEALTH HOOKS
+   * ============================================================ */
+
+  /* ----- WebSocket ----- */
+  const NativeWS = window.WebSocket;
+  const WSHandler = {
+    construct(target, args) {
+      const ws = new target(...args);
+      ws.addEventListener("message", ev => {
+        logs.ws.push({ data: ev.data });
+        autoOpen();
+        if (activeTab === "WS") renderTab();
+      });
+      return ws;
+    }
+  };
+
+  const StealthWS = new Proxy(NativeWS, WSHandler);
+  hideProp(window, "WebSocket", StealthWS);
+  cloneNativeSignature(NativeWS, StealthWS);
+
+  /* ----- XHR ----- */
+  const NativeXHR = window.XMLHttpRequest;
+  function StealthXHR() {
+    const x = new NativeXHR();
+    const open = x.open;
+    hideProp(x, "open", function (m, u, ...r) {
+      x._mcc_u = u;
+      return open.call(x, m, u, ...r);
+    });
+    x.addEventListener("load", () => {
+      logs.xhr.push({ data: { url: x._mcc_u, response: x.response } });
+      autoOpen();
+      if (activeTab === "XHR") renderTab();
+    });
+    return x;
+  }
+  hideProp(window, "XMLHttpRequest", StealthXHR);
+  StealthXHR.prototype = NativeXHR.prototype;
+  cloneNativeSignature(NativeXHR, StealthXHR);
+
+  /* ----- Fetch ----- */
+  const NativeFetch = window.fetch;
+  function stealthFetch(...a) {
+    return NativeFetch(...a).then(r => {
+      r.clone().text().then(t => {
+        logs.xhr.push({ data: { url: a[0], response: t } });
+        autoOpen();
+        if (activeTab === "XHR") renderTab();
+      });
+      return r;
+    });
+  }
+  hideProp(window, "fetch", stealthFetch);
+  cloneNativeSignature(NativeFetch, stealthFetch);
+
+  /* ----- postMessage ----- */
+  const NativePM = window.postMessage;
+
+  const PMProxy = new Proxy(NativePM, {
+    apply(t, th, args) {
+      let msg;
+      try { msg = structuredClone(args[0]); }
+      catch { msg = args[0]; }
+
+      logs.pm.push({ data: msg });
+      autoOpen();
+      if (activeTab === "PM") renderTab();
+
+      Object.values(snippets).forEach(s => {
+        if (s.autorun === "hook" || s.autorun === "always") runSnippet(s);
+      });
+
+      return t.apply(th, args);
+    }
+  });
+  hideProp(window, "postMessage", PMProxy);
+  cloneNativeSignature(NativePM, PMProxy);
+
+  window.addEventListener("message", e => {
+    logs.pm.push({ data: e.data });
+    autoOpen();
+    if (activeTab === "PM") renderTab();
+  });
+
+  /* ============================================================
+   * Auto-open on activity
+   * ============================================================ */
+  function autoOpen() {
+    openP();
+  }
+
+})();
