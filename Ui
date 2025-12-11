@@ -1,4 +1,4 @@
-// /assets/minidevtools-allinone.js
+// /Ui.js
 // Mini DevTools+ Overlay v4 — Snippets + Frames + GitHub Loader
 (() => {
   "use strict";
