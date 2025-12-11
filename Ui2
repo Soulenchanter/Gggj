@@ -1,224 +1,374 @@
+/* Unified Rain Claim + STOMP/WS Hooks
+   - Standalone script to run on page load or via Snippets tab
+   - Posts structured messages via postMessage for overlay consumption
+   - Exposes window.NI_RAIN API: start(), stop(), runOnce(), status()
+   - Designed to be safe: will not silently exfiltrate data; use responsibly
+*/
+(function NI_Rain_Global(){
+  if (window.__NI_RAIN_LOADED__) return;
+  window.__NI_RAIN_LOADED__ = true;
 
-// /Ui.js
-// Mini DevTools+ Overlay v4 — Snippets + Frames + GitHub Loader
-(() => {
-  "use strict";
+  // ================== CONFIG ==================
+  const cfg = {
+    autostart: false,              // if true, starts the recurring claim loop on load
+    intervalMs: 30_000,            // default loop interval
+    maxRetries: 3,
+    baseDelayMs: 800,
+    timeoutMs: 12_000,
+    preferFetch: true,
+    followRedirect: true,
+    claimEndpoint: null,           // override endpoint (string). If null, auto-derive
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    expectJsonResponse: true,
+    wsFallback: false,             // try WS fallback if HTTP fails
+    wsUrl: null,                   // optional WS url for fallback
+    wsPayload: null,               // optional WS payload for fallback
+    verbose: false,                // extra console logging
+  };
 
-  /* ===============================
-     Storage Keys
-  =============================== */
-  const STORAGE_SNIPPETS = "mcc_snippets_v4";
-  const STORAGE_BTN = "mcc_button_pos_v4";
+  // volatile runtime state
+  const state = {
+    running: false,
+    timer: null,
+    stats: { attempts: 0, successes: 0 },
+    lastResult: null
+  };
 
-  let snippets = JSON.parse(localStorage.getItem(STORAGE_SNIPPETS) || "{}");
+  // ================== UTILITIES ==================
+  const nowIso = () => new Date().toISOString();
 
-  function saveSnippets() {
-    localStorage.setItem(STORAGE_SNIPPETS, JSON.stringify(snippets));
+  function logLocal(type, payload){
+    const message = { ni: true, source: 'rain', type, payload, ts: nowIso() };
+    try {
+      window.postMessage(message, '*');
+      if (window.top && window.top !== window) {
+        // also post to top for overlays living in top window
+        try { window.top.postMessage(message, '*'); } catch(e) {}
+      }
+    } catch(e){ /* ignore */ }
+    if (cfg.verbose) console.debug("[NI_RAIN]", type, payload);
   }
 
-  /* ===============================
-     Toast Helper
-  =============================== */
-  function toast(msg, timeout = 3000) {
-    let t = document.getElementById("mcc_toast");
-    if (!t) {
-      t = document.createElement("div");
-      t.id = "mcc_toast";
-      Object.assign(t.style,{
-        position:"fixed",left:"50%",bottom:"80px",
-        transform:"translateX(-50%)",
-        background:"#222",color:"#fff",
-        padding:"10px 14px",borderRadius:"8px",
-        zIndex:9999999,fontFamily:"system-ui,monospace",
-        fontSize:"13px",opacity:0,transition:"opacity 0.3s"
-      });
-      document.body.appendChild(t);
+  function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+
+  function promiseTimeout(p, ms){
+    let id;
+    const timeout = new Promise((_, reject) => id = setTimeout(()=>reject(new Error("timeout")), ms));
+    return Promise.race([p, timeout]).finally(()=> clearTimeout(id));
+  }
+
+  function backoffDelay(attempt){
+    const base = cfg.baseDelayMs * Math.pow(1.8, attempt);
+    return base + Math.floor(Math.random() * (base * 0.3));
+  }
+
+  // safe previewer for bodies (stringify / text)
+  function previewBody(b, max=800){
+    try {
+      if (b === undefined || b === null) return null;
+      if (typeof b === 'string') return b.length > max ? b.slice(0,max) + '...' : b;
+      if (b instanceof Blob || b instanceof ArrayBuffer || ArrayBuffer.isView(b)) return `[Binary ${b.size || b.byteLength || 'N/A'}]`;
+      // try JSON
+      return JSON.stringify(b).slice(0, max) + (JSON.stringify(b).length > max ? '...' : '');
+    } catch(e){ return String(b).slice(0, max); }
+  }
+
+  // ================== NETWORK ATTEMPT HELPERS ==================
+  async function attemptFetch(url, body, headers, method){
+    const opts = { method: method || cfg.method, headers: headers || cfg.headers, cache: "no-store", redirect: cfg.followRedirect ? "follow" : "manual" };
+    if (body !== undefined && body !== null) opts.body = body;
+    const resp = await promiseTimeout(fetch(url, opts), cfg.timeoutMs);
+    const status = resp.status;
+    let text = null, json = null;
+    try { text = await resp.clone().text().catch(()=>null); } catch(e){}
+    try { json = await resp.clone().json().catch(()=>null); } catch(e){}
+    return { status, text, json, resp };
+  }
+
+  function attemptXHR(url, body, headers, method){
+    return new Promise((resolve, reject) => {
+      try {
+        const xhr = new XMLHttpRequest();
+        xhr.open(method || cfg.method, url, true);
+        for (const k in (headers || {})) try { xhr.setRequestHeader(k, headers[k]); } catch(e){}
+        xhr.timeout = cfg.timeoutMs;
+        xhr.onload = () => resolve({ status: xhr.status, text: xhr.responseText, resp: xhr });
+        xhr.onerror = () => reject(new Error("xhr error"));
+        xhr.ontimeout = () => reject(new Error("xhr timeout"));
+        xhr.send(body === undefined ? null : body);
+      } catch (e) { reject(e); }
+    });
+  }
+
+  // heuristic for success (tune per-site)
+  function defaultSuccessHeuristic(text, status, json){
+    if (status >= 200 && status < 300) return true;
+    if (json && (json.success || json.result === "ok" || json.status === "ok")) return true;
+    if (typeof text === "string" && /success|claimed|ok|won/i.test(text)) return true;
+    return false;
+  }
+
+  // try to auto-derive endpoint or body from page
+  function autoDerive(){
+    try {
+      // common patterns
+      if (window.claimUrl) return { url: window.claimUrl };
+      if (window.__CLAIM_ENDPOINT) return { url: window.__CLAIM_ENDPOINT };
+      // form-based
+      const btn = document.querySelector('button[data-claim], button.claim, button[id*="claim"], [data-claim="true"]');
+      if (btn && btn.form){
+        const f = btn.form;
+        const action = f.action || location.href;
+        const data = new FormData(f);
+        return { url: action, body: new URLSearchParams(data).toString(), headers: { "Content-Type": "application/x-www-form-urlencoded" }, method: "POST" };
+      }
+    } catch(e){}
+    return {};
+  }
+
+  // orchestrate attempts with retries/backoff
+  async function runAttemptOnce(opts = {}){
+    const derived = autoDerive();
+    const url = opts.claimEndpoint || cfg.claimEndpoint || derived.url || null;
+    let body = opts.getBody ? await opts.getBody() : (derived.body || opts.body || null);
+    let headers = Object.assign({}, cfg.headers, derived.headers || {}, opts.headers || {});
+    const method = opts.method || cfg.method || derived.method || "POST";
+
+    if (!url) {
+      logLocal('claim_result', { id: null, success:false, info: 'no-endpoint', ts: nowIso() });
+      return { success:false, reason: 'no-endpoint' };
     }
-    t.textContent = msg;
-    t.style.opacity="1";
-    clearTimeout(t._to);
-    t._to = setTimeout(()=>{ t.style.opacity="0"; },timeout);
+
+    const runId = `ni-rain-${Date.now().toString(36)}-${Math.random().toString(36).slice(2,8)}`;
+    logLocal('claim_attempt', { id: runId, cfg: { method, headers }, request: { url, method, bodyPreview: previewBody(body) }, ts: nowIso() });
+
+    // attempt loop
+    for (let attempt = 0; attempt < (opts.maxRetries || cfg.maxRetries || 3); attempt++){
+      try {
+        let sendBody = body;
+        if (sendBody && typeof sendBody === 'object' && headers["Content-Type"] && headers["Content-Type"].includes("application/json")) {
+          try { sendBody = JSON.stringify(sendBody); } catch(e){}
+        }
+
+        let res;
+        if (cfg.preferFetch && window.fetch) res = await attemptFetch(url, sendBody, headers, method);
+        else res = await attemptXHR(url, sendBody, headers, method);
+
+        const ok = (opts.successHeuristic || defaultSuccessHeuristic)(res.text, res.status, res.json);
+        const result = { id: runId, attempt, success: !!ok, info: ok ? 'claimed' : 'rejected', response: { status: res.status, textSnippet: (res.text||'').slice(0,1000), json: res.json||null }, ts: nowIso() };
+
+        // stats
+        state.stats.attempts++;
+        if (ok) state.stats.successes++;
+
+        logLocal('claim_result', result);
+        state.lastResult = result;
+        return result;
+      } catch (err) {
+        logLocal('claim_error', { id: runId, attempt, error: String(err), ts: nowIso() });
+        const wait = backoffDelay(attempt);
+        await sleep(wait);
+        continue;
+      }
+    }
+
+    // failed after retries
+    const fail = { id: runId, success:false, info: 'failed_after_retries', ts: nowIso() };
+    state.stats.attempts++;
+    logLocal('claim_result', fail);
+    state.lastResult = fail;
+    return fail;
   }
 
-  /* ===============================
-     Floating Button
-  =============================== */
-  const floatBtn = document.createElement("button");
-  floatBtn.textContent="≡";
-  Object.assign(floatBtn.style,{
-    position:"fixed",top:"40px",left:"10px",width:"56px",height:"56px",
-    borderRadius:"50%",background:"#1e1e1e",color:"#fff",fontSize:"26px",
-    display:"flex",alignItems:"center",justifyContent:"center",
-    boxShadow:"0 6px 18px rgba(0,0,0,0.6)",border:"none",cursor:"pointer",
-    zIndex:9999998,touchAction:"none"
-  });
-  document.body.appendChild(floatBtn);
-  // restore position
-  try{ const pos=JSON.parse(localStorage.getItem(STORAGE_BTN)); if(pos){ floatBtn.style.left=pos.left; floatBtn.style.top=pos.top; } } catch{}
-  // draggable
-  (function(){
-    let dragging=false,sx=0,sy=0,sl=0,st=0;
-    floatBtn.addEventListener("pointerdown",(e)=>{dragging=true;sx=e.clientX;sy=e.clientY;sl=floatBtn.offsetLeft;st=floatBtn.offsetTop;floatBtn.setPointerCapture(e.pointerId)});
-    floatBtn.addEventListener("pointermove",(e)=>{if(!dragging)return; floatBtn.style.left=Math.max(4,sl+(e.clientX-sx))+"px"; floatBtn.style.top=Math.max(4,st+(e.clientY-sy))+"px";});
-    floatBtn.addEventListener("pointerup",(e)=>{if(!dragging)return; dragging=false; floatBtn.releasePointerCapture(e.pointerId); localStorage.setItem(STORAGE_BTN,JSON.stringify({left:floatBtn.style.left,top:floatBtn.style.top}));});
+  // optionally also do a WS fallback
+  async function attemptWsFallback(payloadString){
+    if (!cfg.wsFallback || !cfg.wsUrl) return { success:false, info: 'no-ws-fallback' };
+    try {
+      const wsRes = await new Promise((resolve, reject) => {
+        try {
+          const ws = new WebSocket(cfg.wsUrl);
+          const t = setTimeout(()=>{ try{ ws.close(); }catch(e){}; reject(new Error("ws timeout")); }, cfg.timeoutMs);
+          ws.addEventListener('open', ()=> ws.send(payloadString));
+          ws.addEventListener('message', ev => { clearTimeout(t); resolve({ text: typeof ev.data === 'string' ? ev.data : null, data: ev.data }); });
+          ws.addEventListener('error', e => { clearTimeout(t); reject(e); });
+        } catch(e) { reject(e); }
+      });
+      const ok = /success|claimed|ok/i.test(wsRes.text || '');
+      const resObj = { id: `ws-fallback-${Date.now().toString(36)}`, success: !!ok, info: 'ws_fallback', payload: wsRes, ts: nowIso() };
+      if (ok) state.stats.successes++;
+      state.stats.attempts++;
+      logLocal('claim_result', resObj);
+      return resObj;
+    } catch (e) {
+      logLocal('claim_result', { id: `ws-fallback-${Date.now().toString(36)}`, success:false, info: 'ws_fallback_error', error:String(e), ts: nowIso() });
+      return { success:false, error:String(e) };
+    }
+  }
+
+  // ================== WS/STOMP HOOKS ==================
+  // Helpers to detect SockJS and STOMP frames and attach listening
+  function tryPatchWebSocket(){
+    try {
+      if (!window.WebSocket) return;
+      if (window.__NI_RAIN_WS_PATCHED__) return;
+      window.__NI_RAIN_WS_PATCHED__ = true;
+
+      const OrigWS = window.WebSocket;
+      function wrapConstructor(url, protocols){
+        const ws = protocols ? new OrigWS(url, protocols) : new OrigWS(url);
+        tryPatchInstance(ws, url);
+        return ws;
+      }
+      // copy prototype/props
+      wrapConstructor.prototype = OrigWS.prototype;
+      window.WebSocket = wrapConstructor;
+
+      function tryPatchInstance(ws, url){
+        if (!ws) return;
+        const origSend = ws.send.bind(ws);
+        ws.send = function(data){
+          try {
+            let preview = (typeof data === 'string') ? data.slice(0,1000) : `[binary ${data && data.byteLength? data.byteLength : 'N/A'}]`;
+            logLocal('ws_send', { url, dataPreview: preview, binary: !(typeof data === 'string'), ts: nowIso() });
+            // STOMP: if text and begins with STOMP commands, parse
+            if (typeof data === 'string' && isLikelyStompFrame(data)) {
+              const parsed = parseStompFrame(data);
+              logLocal('stomp_frame', Object.assign({ url, direction: 'send' }, parsed));
+            }
+          } catch(e){}
+          return origSend(data);
+        };
+
+        ws.addEventListener('message', function(ev){
+          try {
+            const d = ev.data;
+            let preview = (typeof d === 'string') ? d.slice(0,1000) : `[binary ${d && d.byteLength? d.byteLength : 'N/A'}]`;
+            logLocal('ws_recv', { url, dataPreview: preview, binary: !(typeof d === 'string'), ts: nowIso() });
+            if (typeof d === 'string' && isLikelyStompFrame(d)) {
+              const parsed = parseStompFrame(d);
+              logLocal('stomp_frame', Object.assign({ url, direction: 'recv' }, parsed));
+            }
+          } catch(e){}
+        });
+      }
+
+      // attempt to patch any already-open sockets (best-effort)
+      try { const keys = Object.keys(window); for (const k of keys) { try { const v = window[k]; if (v && v instanceof OrigWS) tryPatchInstance(v, v.url || 'unknown'); } catch(e){} } } catch(e){}
+    } catch(e) { console.warn("NI_RAIN WS patch failed", e); }
+  }
+
+  // naive STOMP detection (text frames starting with STOMP commands)
+  function isLikelyStompFrame(txt){
+    if (!txt || typeof txt !== 'string') return false;
+    const head = txt.trim().slice(0,12).toUpperCase();
+    return /^(CONNECT|SEND|MESSAGE|SUBSCRIBE|UNSUBSCRIBE|BEGIN|COMMIT|ABORT|ACK|NACK|DISCONNECT)/.test(head);
+  }
+
+  // simple STOMP frame parser (very permissive)
+  function parseStompFrame(raw){
+    try {
+      // STOMP frame: COMMAND\nheader:val\n...\n\nBODY\0
+      const r = raw;
+      const firstNl = r.indexOf('\n');
+      const command = r.slice(0, firstNl).trim();
+      const rest = r.slice(firstNl+1);
+      const parts = rest.split('\n\n');
+      const headersPart = parts[0] || '';
+      const bodyPart = parts.slice(1).join('\n\n').replace(/\0$/, '');
+      const hdrLines = headersPart.split('\n').filter(Boolean);
+      const headers = {};
+      hdrLines.forEach(line => {
+        const idx = line.indexOf(':');
+        if (idx >= 0) { const k = line.slice(0, idx); const v = line.slice(idx+1); headers[k] = v; }
+      });
+      let parsedBody = bodyPart;
+      try { parsedBody = JSON.parse(bodyPart); } catch(e){}
+      return { command, headers, body: parsedBody, raw };
+    } catch(e){ return { command: 'UNKNOWN', headers: {}, body: raw, raw }; }
+  }
+
+  // enable WS patch now
+  tryPatchWebSocket();
+
+  // also try to detect SockJS send pattern (sockjs wraps messages in arrays/base64) - we hook WS anyway
+
+  // ================== API (start/stop/runOnce/status) ==================
+  async function runOnce(opts = {}) {
+    logLocal('status', { running: true, reason: 'manual-run', ts: nowIso() });
+    const res = await runAttemptOnce(opts);
+    if (!res.success && cfg.wsFallback && cfg.wsUrl && cfg.wsPayload) {
+      try {
+        const wsres = await attemptWsFallback(JSON.stringify(cfg.wsPayload));
+        return wsres;
+      } catch(e){}
+    }
+    return res;
+  }
+
+  async function startLoop(opts = {}) {
+    if (state.running) return;
+    state.running = true;
+    logLocal('status', { running: true, reason: 'startLoop', ts: nowIso() });
+    // immediate run then schedule
+    (async function loop(){
+      try {
+        while (state.running) {
+          state.stats.attempts = state.stats.attempts || 0;
+          state.stats.successes = state.stats.successes || 0;
+          // expose status to overlay (periodic)
+          logLocal('status', { running: true, stats: state.stats, ts: nowIso() });
+          await runOnce(opts);
+          await sleep(opts.intervalMs || cfg.intervalMs || 30000);
+        }
+      } catch(e) {
+        logLocal('status', { running: false, error: String(e), ts: nowIso() });
+        state.running = false;
+      }
+    })();
+  }
+
+  function stopLoop(){
+    state.running = false;
+    logLocal('status', { running: false, reason: 'stopped', ts: nowIso() });
+  }
+
+  function status(){
+    return { running: state.running, stats: state.stats, lastResult: state.lastResult };
+  }
+
+  // attach to window for UI control
+  window.NI_RAIN = {
+    start: (opts) => { startLoop(opts); return status(); },
+    stop: () => { stopLoop(); return status(); },
+    runOnce: (opts) => runOnce(opts),
+    status,
+    cfg,
+    state
+  };
+
+  // ================== ON LOAD BEHAVIOR ==================
+  // post an initial ready message with hooks detected
+  (function announce(){
+    logLocal('ready', { ts: nowIso(), msg: 'NI_RAIN ready', canPatchWS: !!window.WebSocket });
   })();
 
-  /* ===============================
-     Panel
-  =============================== */
-  const panel=document.createElement("div");
-  Object.assign(panel.style,{
-    position:"fixed",right:"-100%",top:"0",width:"90%",height:"100%",
-    background:"#111",color:"#fff",zIndex:9999997,boxShadow:"0 0 30px rgba(0,0,0,0.7)",
-    transition:"right 0.25s",display:"flex",flexDirection:"column",fontFamily:"monospace",
-    overflow:"auto",paddingBottom:"24px"
-  });
-  document.body.appendChild(panel);
-  let panelOpen=false;
-  floatBtn.onclick=()=>{ panelOpen=!panelOpen; panel.style.right=panelOpen?"0":"-100%"; };
+  // run auto-patch for WebSocket if not yet patched
+  tryPatchWebSocket();
 
-  // header
-  const header=document.createElement("div");
-  header.style.display="flex"; header.style.justifyContent="space-between"; header.style.alignItems="center";
-  header.style.padding="12px"; header.style.background="#151515"; header.style.borderBottom="1px solid #222";
-  const htitle=document.createElement("div"); htitle.textContent="Mini DevTools+";
-  const hclose=document.createElement("button"); hclose.textContent="✕";
-  Object.assign(hclose.style,{background:"#222",color:"#fff",border:"none",padding:"6px 12px",borderRadius:"6px",cursor:"pointer"});
-  hclose.onclick=()=>{ panelOpen=false; panel.style.right="-100%"; };
-  header.appendChild(htitle); header.appendChild(hclose);
-  panel.appendChild(header);
-
-  // tabs container
-  const tabsDiv=document.createElement("div");
-  tabsDiv.style.display="flex"; tabsDiv.style.gap="4px"; tabsDiv.style.padding="6px"; tabsDiv.style.background="#000";
-  const tabNames=["Snippets","Frames","GitHub"];
-  let activeTab="Snippets";
-  const tabButtons={};
-  tabNames.forEach(name=>{
-    const b=document.createElement("button"); b.textContent=name; b.dataset.tab=name;
-    b.style.flex="1"; b.style.padding="6px"; b.style.background="#222"; b.style.color="#fff"; b.style.border="none"; b.style.borderRadius="4px";
-    b.onclick=()=>{ activeTab=name; drawActiveTab(); };
-    tabsDiv.appendChild(b); tabButtons[name]=b;
-  });
-  panel.appendChild(tabsDiv);
-
-  // content container
-  const contentDiv=document.createElement("div");
-  contentDiv.style.flex="1"; contentDiv.style.overflow="auto"; contentDiv.style.padding="8px"; panel.appendChild(contentDiv);
-
-  /* ===============================
-     Frames Tree
-  =============================== */
-  function getFramesTree(win=window,parentId=null,depth=0){
-    const frames=[];
-    const ifrs=win.document? [...win.document.querySelectorAll("iframe")]:[];
-    ifrs.forEach((f,i)=>{
-      let label="";
-      let accessible=true, sandbox="";
-      // sandbox
-      try{ sandbox=f.sandbox?f.sandbox.value:""; }catch{}
-      // label priority: name > id > src > fallback
-      if(f.name) label=`${f.name}`;
-      else if(f.id) label=`#${f.id}`;
-      else if(f.src) label=(f.src.length>40?f.src.slice(0,40)+"…":f.src);
-      else label=`iframe ${i}`;
-      let winRef=null;
-      try{ winRef=f.contentWindow; void winRef.location.href; }catch{ accessible=false; winRef=null; label="Cross-Origin "+label; }
-      frames.push({id:parentId?parentId+"_"+i:"f_"+i,label,win:winRef,depth,hidden:f.offsetParent===null, sandbox, children:getFramesTree(winRef,parentId?parentId+"_"+i:"f_"+i,depth+1)}); 
-    });
-    return frames;
+  // auto-start if configured
+  if (cfg.autostart) {
+    setTimeout(()=>{ window.NI_RAIN.start(); }, 400);
   }
 
-  function drawFrameTree() {
-    contentDiv.innerHTML="";
-    const tree=getFramesTree();
-    function renderNode(node){
-      const div=document.createElement("div");
-      div.style.marginLeft=(node.depth*14)+"px"; div.style.display="flex"; div.style.alignItems="center"; div.style.gap="6px";
-      const lbl=document.createElement("span");
-      lbl.textContent=node.label+(node.hidden?" [hidden]":"")+(node.sandbox?" [sandbox:"+node.sandbox+"]":"")+(node.win?"":" [no-access]");
-      div.appendChild(lbl);
-      contentDiv.appendChild(div);
-      node.children.forEach(child=>renderNode(child));
+  // ================== for debugging: expose helper to merge with overlay logs ==================
+  // overlay can call window.postMessage({ ni:true, source:'overlay', type:'merge_request', payload:{ lastLogId: '...' }}, '*')
+  window.addEventListener('message', (e) => {
+    const m = e.data;
+    if (!m || m.ni !== true) return;
+    if (m.source === 'overlay' && m.type === 'ping') {
+      logLocal('pong', { ts: nowIso(), info: 'pong from rain' });
     }
-    tree.forEach(n=>renderNode(n));
-  }
+  });
 
-  /* ===============================
-     Snippets Tab
-  =============================== */
-  function drawSnippetsTab(){
-    contentDiv.innerHTML="";
-    const editor=document.createElement("div"); editor.style.display="flex"; editor.style.flexDirection="column"; editor.style.gap="6px";
-    const nameInput=document.createElement("input"); nameInput.placeholder="Snippet Name"; nameInput.style.padding="6px";
-    const codeArea=document.createElement("textarea"); codeArea.rows=8; codeArea.placeholder="// JS Code"; codeArea.style.padding="6px";
-    const targetSelect=document.createElement("select"); targetSelect.style.padding="6px";
-    const modeSelect=document.createElement("select"); ["manual","start","idle","end","always"].forEach(m=>{ const o=document.createElement("option"); o.value=m; o.textContent=m; modeSelect.appendChild(o); });
-    const saveBtn=document.createElement("button"); saveBtn.textContent="Save"; const runBtn=document.createElement("button"); runBtn.textContent="Run"; const delBtn=document.createElement("button"); delBtn.textContent="Delete";
-    [saveBtn,runBtn,delBtn].forEach(b=>{b.style.padding="6px"; b.style.borderRadius="6px"; b.style.border="none"; b.style.background="#222"; b.style.color="#fff"; editor.appendChild(b);});
-    editor.appendChild(nameInput); editor.appendChild(codeArea); editor.appendChild(targetSelect); editor.appendChild(modeSelect);
-    contentDiv.appendChild(editor);
-
-    // populate frames
-    const framesFlat=getFramesTree();
-    function flattenFrames(arr){ return arr.reduce((acc,n)=>[...acc,n,...flattenFrames(n.children)],[]); }
-    const flatFrames=flattenFrames(framesFlat);
-    targetSelect.innerHTML=""; flatFrames.forEach((f,i)=>{ const opt=document.createElement("option"); opt.value=i; opt.textContent=`${i}. ${f.label}`; if(!f.win) opt.disabled=true; targetSelect.appendChild(opt); });
-
-    function runSnippet(s){
-      const idx=parseInt(s.target||0,10);
-      const f=flatFrames[idx]; if(!f) return toast("Invalid frame");
-      if(f.win){ try{ f.win.eval(s.code); toast("Ran "+s.name);}catch{ f.win.postMessage({__mcc_eval:true,code:s.code},"*"); toast("PostMessage fallback"); } }
-      else toast("No access");
-    }
-
-    saveBtn.onclick=()=>{
-      const n=nameInput.value.trim(); if(!n) return toast("Provide name");
-      snippets[n]={name:n,code:codeArea.value,target:targetSelect.value,mode:modeSelect.value};
-      saveSnippets(); toast("Saved"); runSnippet(snippets[n]);
-    };
-    runBtn.onclick=()=>{ const n=nameInput.value.trim(); if(snippets[n]) runSnippet(snippets[n]); else toast("Snippet not found"); };
-    delBtn.onclick=()=>{ const n=nameInput.value.trim(); if(snippets[n]){ delete snippets[n]; saveSnippets(); toast("Deleted"); }else toast("Not found"); };
-  }
-
-  /* ===============================
-     GitHub Loader
-  =============================== */
-  function drawGitHubTab(){
-    contentDiv.innerHTML="";
-    const urlInput=document.createElement("input"); urlInput.placeholder="GitHub Raw URL"; urlInput.style.width="100%"; urlInput.style.padding="6px";
-    const fetchBtn=document.createElement("button"); fetchBtn.textContent="Fetch"; fetchBtn.style.margin="4px 0"; const copyBtn=document.createElement("button"); copyBtn.textContent="Copy"; const saveBtn=document.createElement("button"); saveBtn.textContent="Save as Snippet";
-    [fetchBtn,copyBtn,saveBtn].forEach(b=>{b.style.padding="6px"; b.style.borderRadius="6px"; b.style.border="none"; b.style.background="#222"; b.style.color="#fff"; b.style.marginRight="4px";});
-    const pre=document.createElement("pre"); pre.style.background="#000"; pre.style.color="#0f0"; pre.style.padding="6px"; pre.style.overflowX="auto"; pre.style.maxHeight="300px";
-    contentDiv.appendChild(urlInput); contentDiv.appendChild(fetchBtn); contentDiv.appendChild(copyBtn); contentDiv.appendChild(saveBtn); contentDiv.appendChild(pre);
-
-    fetchBtn.onclick=async()=>{
-      const url=urlInput.value.trim(); if(!url) return toast("Enter URL");
-      try{ const txt=await fetch(url).then(r=>r.text()); pre.textContent=txt; toast("Fetched"); }catch{toast("Failed");}
-    };
-    copyBtn.onclick=()=>{ navigator.clipboard.writeText(pre.textContent).then(()=>toast("Copied")); };
-    saveBtn.onclick=()=>{
-      const code=pre.textContent; if(!code) return toast("No code");
-      const name="GH_"+Math.floor(Math.random()*9999);
-      snippets[name]={name,code,target:0,mode:"manual"}; saveSnippets(); toast("Saved snippet: "+name);
-    };
-  }
-
-  /* ===============================
-     Tab Switcher
-  =============================== */
-  function drawActiveTab(){
-    if(activeTab==="Frames") drawFrameTree();
-    else if(activeTab==="Snippets") drawSnippetsTab();
-    else if(activeTab==="GitHub") drawGitHubTab();
-  }
-
-  drawActiveTab();
-
-  // MutationObserver for dynamic frames
-  new MutationObserver(()=>{ if(activeTab==="Frames") drawFrameTree(); }).observe(document.body,{childList:true,subtree:true});
-
-  // Auto-run start/always snippets on top window
-  window.addEventListener("load",()=>{ Object.values(snippets).forEach(s=>{ if(s.mode==="start"||s.mode==="always") drawSnippetsTab(); }); });
-
-})();
+})(); // end NI_Rain_Global wrapper
