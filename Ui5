@@ -1,0 +1,1517 @@
+
+
+(function () {
+
+  "use strict";
+
+
+
+  // -------------------------
+
+  // CONFIG
+
+  // -------------------------
+
+  const PAKO_CDN = "https://unpkg.com/pako@2.1.0/dist/pako.min.js";
+
+  const PANEL_ID = "__rain_overlay_userscript__";
+
+  const STORAGE_KEY = "rain_overlay_settings_v1";
+
+  const DEFAULT_SETTINGS = {
+
+    replayDelay: 120,
+
+    autoDecodeOnCapture: true,
+
+    preferCompression: "zlib", // zlib | deflate | gzip | none
+
+    maxMessages: 800,
+
+  };
+
+
+
+  // -------------------------
+
+  // UTILITIES
+
+  // -------------------------
+
+  function log(...args) { console.log("[RainOverlay]", ...args); }
+
+  function el(tag = "div", props = {}, style = {}) {
+
+    const d = document.createElement(tag);
+
+    Object.assign(d, props);
+
+    Object.assign(d.style, style);
+
+    return d;
+
+  }
+
+  function loadPako(cb) {
+
+    if (window.pako) return cb(null, window.pako);
+
+    const s = document.createElement("script");
+
+    s.src = PAKO_CDN;
+
+    s.onload = () => cb(null, window.pako);
+
+    s.onerror = (e) => cb(new Error("Failed to load pako"));
+
+    document.head.appendChild(s);
+
+  }
+
+  function saveSettings(s) { localStorage.setItem(STORAGE_KEY, JSON.stringify(s)); }
+
+  function loadSettings() { try { return Object.assign({}, DEFAULT_SETTINGS, JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}")); } catch (e) { return Object.assign({}, DEFAULT_SETTINGS); } }
+
+  const settings = loadSettings();
+
+
+
+  function arrayBufferToUint8(a) {
+
+    if (a instanceof Uint8Array) return a;
+
+    if (a instanceof ArrayBuffer) return new Uint8Array(a);
+
+    if (a && a.buffer instanceof ArrayBuffer) return new Uint8Array(a.buffer);
+
+    throw new Error("Unsupported buffer type");
+
+  }
+
+  function blobToUint8(blob) {
+
+    return new Promise((res, rej) => {
+
+      const fr = new FileReader();
+
+      fr.onload = () => res(new Uint8Array(fr.result));
+
+      fr.onerror = () => rej(fr.error);
+
+      fr.readAsArrayBuffer(blob);
+
+    });
+
+  }
+
+  function tryParseJson(txt) { try { return JSON.parse(txt); } catch { return null; } }
+
+  function isGzip(u) { return u && u.length > 2 && u[0] === 0x1f && u[1] === 0x8b; }
+
+  function isZlib(u) { return u && u.length > 1 && u[0] === 0x78; }
+
+  function uint8ToBase64(u8) {
+
+    let CHUNK = 0x8000;
+
+    let i = 0;
+
+    let out = "";
+
+    while (i < u8.length) {
+
+      const slice = u8.subarray(i, Math.min(i + CHUNK, u8.length));
+
+      out += String.fromCharCode.apply(null, slice);
+
+      i += CHUNK;
+
+    }
+
+    return btoa(out);
+
+  }
+
+  function base64ToUint8(b64) {
+
+    const bin = atob(b64);
+
+    const u = new Uint8Array(bin.length);
+
+    for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+
+    return u;
+
+  }
+
+
+
+  // -------------------------
+
+  // BLUEBOX BINARY HANDLER
+
+  // - decodeBuffer(raw) -> { ok, method, text, json, bytes, sockjsWrapped }
+
+  // - encodeJson(obj, method) -> Uint8Array
+
+  // - wrapSockJs(bytes) -> 'a["<base64>"]'
+
+  // -------------------------
+
+  const BlueBox = {
+
+    async decodeBuffer(raw) {
+
+      await new Promise((r) => loadPako(r));
+
+      try {
+
+        let u;
+
+        if (raw instanceof Blob) u = await blobToUint8(raw);
+
+        else if (raw instanceof ArrayBuffer) u = arrayBufferToUint8(raw);
+
+        else if (raw instanceof Uint8Array) u = raw;
+
+        else if (typeof raw === "string") u = new TextEncoder().encode(raw);
+
+        else return { ok: false, error: new Error("unsupported raw type") };
+
+
+
+        // plain detection
+
+        if (isGzip(u)) {
+
+          try {
+
+            const txt = window.pako.ungzip(u, { to: "string" });
+
+            return { ok: true, method: "gzip", text: txt, json: tryParseJson(txt), bytes: u, sockjsWrapped: false };
+
+          } catch (e) { /* continue */ }
+
+        }
+
+        if (isZlib(u)) {
+
+          try {
+
+            const txt = window.pako.inflate(u, { to: "string" });
+
+            return { ok: true, method: "zlib", text: txt, json: tryParseJson(txt), bytes: u, sockjsWrapped: false };
+
+          } catch (e) { /* continue */ }
+
+        }
+
+        try {
+
+          const txt = window.pako.inflateRaw(u, { to: "string" });
+
+          return { ok: true, method: "deflate", text: txt, json: tryParseJson(txt), bytes: u, sockjsWrapped: false };
+
+        } catch (e) { /* continue */ }
+
+
+
+        // try as UTF-8 text
+
+        try {
+
+          const txt = new TextDecoder().decode(u);
+
+          const j = tryParseJson(txt);
+
+          if (j) return { ok: true, method: "none", text: txt, json: j, bytes: u, sockjsWrapped: false };
+
+        } catch (e) {}
+
+
+
+        // sockjs 'a["<base64>"]' pattern (best-effort)
+
+        if (typeof raw === "string" && raw.startsWith("a[")) {
+
+          const m = raw.match(/a\[(?:\"|')([A-Za-z0-9+/=\s]+)(?:\"|')\]/);
+
+          if (m && m[1]) {
+
+            try {
+
+              const u2 = base64ToUint8(m[1].replace(/\s+/g, ""));
+
+              if (isGzip(u2)) {
+
+                const txt = window.pako.ungzip(u2, { to: "string" });
+
+                return { ok: true, method: "gzip", text: txt, json: tryParseJson(txt), bytes: u2, sockjsWrapped: true };
+
+              }
+
+              if (isZlib(u2)) {
+
+                const txt = window.pako.inflate(u2, { to: "string" });
+
+                return { ok: true, method: "zlib", text: txt, json: tryParseJson(txt), bytes: u2, sockjsWrapped: true };
+
+              }
+
+              try {
+
+                const txt = window.pako.inflateRaw(u2, { to: "string" });
+
+                return { ok: true, method: "deflate", text: txt, json: tryParseJson(txt), bytes: u2, sockjsWrapped: true };
+
+              } catch (e) {}
+
+            } catch (e) {}
+
+          }
+
+        }
+
+
+
+        return { ok: false, error: new Error("no decode"), bytes: u };
+
+      } catch (e) {
+
+        return { ok: false, error: e };
+
+      }
+
+    },
+
+
+
+    encodeJson(obj, method = "zlib") {
+
+      if (!window.pako) throw new Error("pako required");
+
+      const text = typeof obj === "string" ? obj : JSON.stringify(obj);
+
+      if (method === "gzip") return window.pako.gzip(text);
+
+      if (method === "deflate") return window.pako.deflateRaw(text);
+
+      // default zlib (deflate + wrapper)
+
+      return window.pako.deflate(text);
+
+    },
+
+
+
+    wrapSockJs(bytes) {
+
+      return 'a["' + uint8ToBase64(bytes) + '"]';
+
+    },
+
+  };
+
+
+
+  // -------------------------
+
+  // COLLAPSIBLE JSON TREE EDITOR
+
+  // - createJsonTreeEditor(rootObj) => { container, getEdited, rerender }
+
+  // - inline edit per node, add/remove keys
+
+  // -------------------------
+
+  function createJsonTreeEditor(rootObj) {
+
+    function elLocal(tag = "div", props = {}, style = {}) {
+
+      const d = document.createElement(tag);
+
+      Object.assign(d, props);
+
+      Object.assign(d.style, style);
+
+      return d;
+
+    }
+
+
+
+    function getByPath(obj, path) {
+
+      let o = obj;
+
+      for (const p of path) o = o[p];
+
+      return o;
+
+    }
+
+    function setByPath(obj, path, val) {
+
+      let o = obj;
+
+      for (let i = 0; i < path.length - 1; i++) o = o[path[i]];
+
+      o[path[path.length - 1]] = val;
+
+    }
+
+    function deleteByPath(obj, path) {
+
+      let o = obj;
+
+      for (let i = 0; i < path.length - 1; i++) o = o[path[i]];
+
+      const key = path[path.length - 1];
+
+      if (Array.isArray(o)) o.splice(key, 1);
+
+      else delete o[key];
+
+    }
+
+
+
+    function buildNode(key, value, path) {
+
+      const node = elLocal("div", {}, { marginLeft: "8px", marginTop: "4px" });
+
+      const header = elLocal("div", {}, { display: "flex", gap: "6px", alignItems: "center" });
+
+      const isObj = typeof value === "object" && value !== null;
+
+      const toggle = elLocal("span", { textContent: isObj ? "▾" : "" }, { cursor: isObj ? "pointer" : "default", width: "14px" });
+
+      header.append(toggle);
+
+
+
+      const keyInput = elLocal("input", { value: String(key) }, { background: "#111", color: "#8cf", border: "1px solid #333", padding: "2px" });
+
+      keyInput.onchange = () => {
+
+        const newKey = keyInput.value;
+
+        const parentPath = path.slice(0, -1);
+
+        const parent = parentPath.length ? getByPath(rootObj, parentPath) : rootObj;
+
+        const oldKey = path[path.length - 1];
+
+        if (Array.isArray(parent)) return; // can't rename array index
+
+        if (newKey !== oldKey) {
+
+          parent[newKey] = parent[oldKey];
+
+          delete parent[oldKey];
+
+          rerender();
+
+        }
+
+      };
+
+      header.append(keyInput);
+
+
+
+      if (!isObj) {
+
+        const valInput = elLocal("input", { value: String(value) }, { background: "#111", color: "#cfc", border: "1px solid #333", padding: "2px" });
+
+        valInput.onchange = () => {
+
+          let parsed = valInput.value;
+
+          try { parsed = JSON.parse(valInput.value); } catch { /* keep string */ }
+
+          setByPath(rootObj, path, parsed);
+
+        };
+
+        header.append(valInput);
+
+      }
+
+
+
+      const addBtn = elLocal("button", { textContent: "+" }, { padding: "2px" });
+
+      addBtn.onclick = () => {
+
+        if (!isObj) return;
+
+        const p = getByPath(rootObj, path);
+
+        if (Array.isArray(p)) p.push("");
+
+        else {
+
+          let k = "newKey", i = 1;
+
+          while (k in p) k = "newKey" + (i++);
+
+          p[k] = "";
+
+        }
+
+        rerender();
+
+      };
+
+      if (isObj) header.append(addBtn);
+
+
+
+      const delBtn = elLocal("button", { textContent: "✕" }, { padding: "2px" });
+
+      delBtn.onclick = () => { deleteByPath(rootObj, path); rerender(); };
+
+      header.append(delBtn);
+
+
+
+      node.append(header);
+
+
+
+      if (isObj) {
+
+        const body = elLocal("div", {}, { marginLeft: "12px" });
+
+        toggle.onclick = () => { body.style.display = body.style.display === "none" ? "block" : "none"; toggle.textContent = body.style.display === "none" ? "▸" : "▾"; };
+
+        if (Array.isArray(value)) {
+
+          value.forEach((v, i) => body.append(buildNode(i, v, path.concat(i))));
+
+        } else {
+
+          Object.keys(value).forEach(k => body.append(buildNode(k, value[k], path.concat(k))));
+
+        }
+
+        node.append(body);
+
+      }
+
+
+
+      return node;
+
+    }
+
+
+
+    const container = elLocal("div", {}, { fontFamily: "monospace", fontSize: "12px", color: "#eee" });
+
+    function rerender() {
+
+      container.innerHTML = "";
+
+      container.append(buildNode("(root)", rootObj, []));
+
+    }
+
+    rerender();
+
+    return { container, getEdited: () => rootObj, rerender };
+
+  }
+
+
+
+  // -------------------------
+
+  // REPLAY ENGINE (basic)
+
+  // - replay(entries, opts)
+
+  // -------------------------
+
+  async function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+  async function replay(entries = [], opts = {}) {
+
+    const delay = opts.delay ?? settings.replayDelay;
+
+    const loop = !!opts.loop;
+
+    const socket = opts.socket || null;
+
+    if (!socket) throw new Error("no socket provided");
+
+    do {
+
+      for (const entry of entries) {
+
+        try {
+
+          const payload = (() => {
+
+            if (entry.bytes) return entry.bytes;              // binary previously decoded bytes (use as-is)
+
+            if (entry.obj && typeof entry.obj === "object") return JSON.stringify(entry.obj);
+
+            if (entry.decodedText) return entry.decodedText;
+
+            return entry.raw;
+
+          })();
+
+          if (payload instanceof Uint8Array || payload instanceof ArrayBuffer) socket.send(payload);
+
+          else socket.send(payload);
+
+        } catch (e) {
+
+          console.warn("replay send error", e);
+
+        }
+
+        await sleep(delay);
+
+      }
+
+    } while (loop);
+
+  }
+
+
+
+  // -------------------------
+
+  // CAPTURE / HOOKS
+
+  // - patch WebSocket constructor to track sockets
+
+  // - patch addEventListener('message') to intercept incoming frames
+
+  // - patch STOMP handler if present (window.__RAIN_HANDLE_MESSAGE__ or similar)
+
+  // -------------------------
+
+  const State = {
+
+    sockets: new Set(),
+
+    messages: [], // captured entries
+
+  };
+
+
+
+  // patch WebSocket constructor so we can label sockets
+
+  (function patchWSConstructor() {
+
+    if (window.__RAIN_WS_PATCHED__) return;
+
+    const NativeWS = window.WebSocket;
+
+    const Wrapped = function (url, protocols) {
+
+      const ws = protocols ? new NativeWS(url, protocols) : new NativeWS(url);
+
+      try {
+
+        ws.__RAIN_SOCKET_ID__ = "ws#" + Math.random().toString(36).slice(2, 8);
+
+        ws.__RAIN_SOCKET_URL__ = url;
+
+        State.sockets.add(ws);
+
+        const origClose = ws.close.bind(ws);
+
+        ws.close = function (...args) {
+
+          State.sockets.delete(ws);
+
+          return origClose(...args);
+
+        };
+
+      } catch (e) { /* ignore */ }
+
+      return ws;
+
+    };
+
+    Wrapped.prototype = NativeWS.prototype;
+
+    Wrapped.CONNECTING = NativeWS.CONNECTING;
+
+    Wrapped.OPEN = NativeWS.OPEN;
+
+    Wrapped.CLOSING = NativeWS.CLOSING;
+
+    Wrapped.CLOSED = NativeWS.CLOSED;
+
+    window.WebSocket = Wrapped;
+
+    window.__RAIN_WS_PATCHED__ = true;
+
+    log("Patched WebSocket constructor");
+
+  })();
+
+
+
+  // patch addEventListener to intercept message events
+
+  (function patchAddEventListener() {
+
+    const NativeWSProto = window.WebSocket.prototype;
+
+    if (NativeWSProto.__RAIN_ADD__) return;
+
+    NativeWSProto.__RAIN_ADD__ = true;
+
+    const origAdd = NativeWSProto.addEventListener;
+
+    NativeWSProto.addEventListener = function (type, listener, ...rest) {
+
+      if (type === "message") {
+
+        const wrapped = async (event) => {
+
+          try {
+
+            const raw = event.data;
+
+            let decoded = null;
+
+            if (settings.autoDecodeOnCapture) {
+
+              try {
+
+                decoded = await BlueBox.decodeBuffer(raw);
+
+              } catch (e) { decoded = null; }
+
+            }
+
+            const entry = {
+
+              id: "m" + (State.messages.length + 1),
+
+              ts: Date.now(),
+
+              source: "WS",
+
+              socket: this,
+
+              socketId: this.__RAIN_SOCKET_ID__ || null,
+
+              raw,
+
+              decodedMethod: decoded ? decoded.method : null,
+
+              decodedText: decoded ? decoded.text : null,
+
+              obj: decoded ? (decoded.json !== null ? decoded.json : decoded.text || null) : null,
+
+              bytes: decoded && decoded.bytes ? decoded.bytes : null,
+
+              sockjsWrapped: decoded && decoded.sockjsWrapped ? true : false,
+
+            };
+
+            State.messages.push(entry);
+
+            if (State.messages.length > settings.maxMessages) State.messages.shift();
+
+            busEmit("messageCaptured", entry);
+
+          } catch (e) { console.warn("intercept error", e); }
+
+          try { listener.call(this, event); } catch (e) { console.warn("listener threw", e); }
+
+        };
+
+        return origAdd.call(this, type, wrapped, ...rest);
+
+      }
+
+      return origAdd.call(this, type, listener, ...rest);
+
+    };
+
+    log("Patched WebSocket.prototype.addEventListener");
+
+  })();
+
+
+
+  // optional STOMP style handler patch (common projects define __RAIN_HANDLE_MESSAGE__ or similar)
+
+  (function patchStompHandler() {
+
+    const cand = window.__RAIN_HANDLE_MESSAGE__ || window.__RAIN_HANDLE__ || null;
+
+    if (!cand || cand.__RAIN_STOMP_PATCHED__) return;
+
+    try {
+
+      if (window.__RAIN_HANDLE_MESSAGE__) {
+
+        const orig = window.__RAIN_HANDLE_MESSAGE__;
+
+        window.__ORIG_RAIN_HANDLE__ = orig;
+
+        window.__RAIN_HANDLE_MESSAGE__ = async function (raw, ws) {
+
+          try {
+
+            let decoded = null;
+
+            if (settings.autoDecodeOnCapture) decoded = await BlueBox.decodeBuffer(raw);
+
+            const entry = {
+
+              id: "m" + (State.messages.length + 1),
+
+              ts: Date.now(),
+
+              source: "STOMP",
+
+              socket: ws || null,
+
+              raw,
+
+              decodedMethod: decoded ? decoded.method : null,
+
+              decodedText: decoded ? decoded.text : null,
+
+              obj: decoded ? (decoded.json !== null ? decoded.json : decoded.text || null) : null,
+
+              bytes: decoded && decoded.bytes ? decoded.bytes : null,
+
+              sockjsWrapped: decoded && decoded.sockjsWrapped ? true : false,
+
+            };
+
+            State.messages.push(entry);
+
+            if (State.messages.length > settings.maxMessages) State.messages.shift();
+
+            busEmit("messageCaptured", entry);
+
+          } catch (e) { console.warn("stomp intercept error", e); }
+
+          return orig.apply(this, arguments);
+
+        };
+
+        window.__RAIN_HANDLE_MESSAGE__.__RAIN_STOMP_PATCHED__ = true;
+
+        log("Patched __RAIN_HANDLE_MESSAGE__ (STOMP)");
+
+      }
+
+    } catch (e) {
+
+      console.warn("patchStompHandler err", e);
+
+    }
+
+  })();
+
+
+
+  // -------------------------
+
+  // MINI EVENT BUS
+
+  // -------------------------
+
+  const _bus = {};
+
+  function busOn(evt, fn) { (_bus[evt] = _bus[evt] || []).push(fn); }
+
+  function busEmit(evt, payload) { (_bus[evt] || []).forEach((f) => { try { f(payload); } catch (e) { console.warn("bus handler error", e); } }); }
+
+
+
+  // -------------------------
+
+  // UI: Panel, tabs, lists
+
+  // -------------------------
+
+  function createUI() {
+
+    if (document.getElementById(PANEL_ID)) return document.getElementById(PANEL_ID);
+
+    const panel = el("div", { id: PANEL_ID }, {
+
+      position: "fixed",
+
+      right: "12px",
+
+      bottom: "12px",
+
+      width: "720px",
+
+      maxHeight: "80vh",
+
+      zIndex: 2147483647,
+
+      background: "rgba(6,6,8,0.95)",
+
+      color: "#eee",
+
+      fontFamily: "ui-monospace,monospace",
+
+      border: "1px solid #222",
+
+      borderRadius: "8px",
+
+      boxShadow: "0 8px 40px rgba(0,0,0,0.6)",
+
+      overflow: "hidden",
+
+    });
+
+
+
+    // header
+
+    const header = el("div", {}, { display: "flex", alignItems: "center", gap: "8px", padding: "8px", borderBottom: "1px solid #111" });
+
+    header.append(el("div", { innerText: "Rain Overlay" }, { color: "#8cf", fontWeight: 700, flex: "1" }));
+
+    const closeBtn = el("button", { textContent: "×" }, { background: "#222", color: "#8cf", border: "1px solid #333", padding: "4px", borderRadius: "4px" });
+
+    closeBtn.onclick = () => panel.remove();
+
+    header.append(closeBtn);
+
+    panel.append(header);
+
+
+
+    // content area
+
+    const content = el("div", {}, { display: "flex", gap: "8px", padding: "8px" });
+
+    panel.append(content);
+
+
+
+    // left: messages list
+
+    const left = el("div", {}, { width: "360px", overflow: "auto", maxHeight: "64vh", borderRight: "1px solid #111" });
+
+    content.append(left);
+
+
+
+    // search + filters
+
+    const controls = el("div", {}, { display: "flex", gap: "6px", marginBottom: "6px" });
+
+    const filterInput = el("input", { placeholder: "filter (type, rainId, playerId...)" }, { flex: 1, padding: "6px", background: "#0b0b0b", color: "#eee", border: "1px solid #333" });
+
+    const refreshBtn = el("button", { textContent: "Refresh sockets" }, { padding: "6px", background: "#333", color: "#8cf" });
+
+    controls.append(filterInput, refreshBtn);
+
+    left.append(controls);
+
+
+
+    const listWrap = el("div", {}, { fontFamily: "monospace", fontSize: "12px" });
+
+    left.append(listWrap);
+
+
+
+    // right: inspectors / editor / replay
+
+    const right = el("div", {}, { flex: 1, paddingLeft: "8px", overflow: "auto", maxHeight: "64vh" });
+
+    content.append(right);
+
+
+
+    // tabs on right
+
+    const tabBar = el("div", {}, { display: "flex", gap: "6px", marginBottom: "6px" });
+
+    const tabs = { "Decoded": null, "Tree": null, "Binary": null, "Replay": null, "Settings": null };
+
+    const tabEls = {};
+
+    Object.keys(tabs).forEach((t) => {
+
+      const b = el("button", { textContent: t }, { padding: "6px", background: "#111", color: "#ccc", border: "1px solid #222" });
+
+      tabBar.append(b); tabEls[t] = b;
+
+    });
+
+    right.append(tabBar);
+
+
+
+    const inspector = el("div", {}, { borderTop: "1px solid #111", paddingTop: "8px" });
+
+    right.append(inspector);
+
+
+
+    // areas
+
+    const decodedArea = el("pre", { innerText: "Select a message..." }, { whiteSpace: "pre-wrap", background: "#030304", padding: "8px", borderRadius: "6px", maxHeight: "44vh", overflow: "auto" });
+
+    const treeArea = el("div", {}, { maxHeight: "44vh", overflow: "auto" });
+
+    const binaryArea = el("div", {}, { maxHeight: "44vh", overflow: "auto" });
+
+    const replayArea = el("div", {}, { maxHeight: "44vh", overflow: "auto" });
+
+    const settingsArea = el("div", {}, { maxHeight: "44vh", overflow: "auto" });
+
+
+
+    inspector.append(decodedArea);
+
+    inspector.append(treeArea);
+
+    inspector.append(binaryArea);
+
+    inspector.append(replayArea);
+
+    inspector.append(settingsArea);
+
+
+
+    function showTab(name) {
+
+      decodedArea.style.display = name === "Decoded" ? "block" : "none";
+
+      treeArea.style.display = name === "Tree" ? "block" : "none";
+
+      binaryArea.style.display = name === "Binary" ? "block" : "none";
+
+      replayArea.style.display = name === "Replay" ? "block" : "none";
+
+      settingsArea.style.display = name === "Settings" ? "block" : "none";
+
+    }
+
+    showTab("Decoded");
+
+    Object.keys(tabEls).forEach((t) => tabEls[t].onclick = () => showTab(t));
+
+
+
+    // settings content
+
+    settingsArea.append(el("div", { innerText: "Settings" }, { fontWeight: 700 }));
+
+    const autoDecodeChk = el("input", { type: "checkbox", checked: settings.autoDecodeOnCapture });
+
+    const autoDecodeLabel = el("label", { innerText: " Auto-decode on capture" });
+
+    autoDecodeLabel.prepend(autoDecodeChk);
+
+    settingsArea.append(autoDecodeLabel);
+
+
+
+    const preferSel = el("select", {}, { marginLeft: "8px", padding: "6px" });
+
+    ["zlib", "deflate", "gzip", "none"].forEach(m => preferSel.append(el("option", { value: m, textContent: m })));
+
+    preferSel.value = settings.preferCompression;
+
+    settingsArea.append(el("div", {}, { marginTop: "8px" }, ));
+
+    settingsArea.append(el("div", { innerText: "Preferred compression for re-send:" }, {}));
+
+    settingsArea.append(preferSel);
+
+
+
+    const saveSettingsBtn = el("button", { textContent: "Save settings" }, { marginTop: "8px", padding: "6px", background: "#2a7", color: "#061" });
+
+    saveSettingsBtn.onclick = () => {
+
+      settings.autoDecodeOnCapture = !!autoDecodeChk.checked;
+
+      settings.preferCompression = preferSel.value;
+
+      saveSettings(settings);
+
+      alert("Settings saved");
+
+    };
+
+    settingsArea.append(saveSettingsBtn);
+
+
+
+    // wire refresh sockets (populated from State.sockets)
+
+    refreshBtn.onclick = () => {
+
+      alert("Sockets captured: " + Array.from(State.sockets).map(s => s.__RAIN_SOCKET_ID__ + " " + (s.__RAIN_SOCKET_URL__ || "")).join(", "));
+
+    };
+
+
+
+    // render list update function
+
+    function renderList(filter = "") {
+
+      listWrap.innerHTML = "";
+
+      const arr = State.messages.filter(m => {
+
+        if (!filter) return true;
+
+        const q = filter.toLowerCase();
+
+        if ((m.source || "").toLowerCase().includes(q)) return true;
+
+        if ((m.decodedMethod || "").toLowerCase().includes(q)) return true;
+
+        if ((m.sockjsWrapped ? "sockjs" : "").includes(q)) return true;
+
+        if (m.obj && JSON.stringify(m.obj).toLowerCase().includes(q)) return true;
+
+        return false;
+
+      });
+
+      for (let i = arr.length - 1; i >= 0; i--) {
+
+        const e = arr[i];
+
+        const row = el("div", {}, { padding: "6px", borderBottom: "1px solid #111", display: "flex", justifyContent: "space-between", gap: "8px" });
+
+        const left = el("div", {}, { flex: 1 });
+
+        left.append(el("div", { innerText: `[${new Date(e.ts).toLocaleTimeString()}] ${e.source} ${e.decodedMethod ? "(" + e.decodedMethod + ")" : ""}` }, {}));
+
+        left.append(el("div", { innerText: e.sockjsWrapped ? "[sockjs]" : "", title: e.sockjsWrapped ? "sockjs wrapped" : "" }, { color: "#9aa", fontSize: "11px" }));
+
+        const right = el("div", {}, {});
+
+        const viewBtn = el("button", { textContent: "View" }, { padding: "4px" });
+
+        viewBtn.onclick = () => openEntry(e);
+
+        right.append(viewBtn);
+
+        row.append(left, right);
+
+        listWrap.append(row);
+
+      }
+
+    }
+
+
+
+    // filter input wiring
+
+    filterInput.oninput = () => renderList(filterInput.value);
+
+
+
+    // handle new captured message events
+
+    busOn("messageCaptured", (entry) => {
+
+      renderList(filterInput.value);
+
+    });
+
+
+
+    // selected entry UI
+
+    let currentEntry = null;
+
+    function openEntry(entry) {
+
+      currentEntry = entry;
+
+      // decoded
+
+      decodedArea.innerText = ""; // fill
+
+      if (entry.obj && typeof entry.obj === "object") decodedArea.innerText = JSON.stringify(entry.obj, null, 2);
+
+      else decodedArea.innerText = entry.decodedText || (typeof entry.raw === "string" ? entry.raw : "[binary data]\n(Select Binary tab for bytes)");
+
+      // tree
+
+      treeArea.innerHTML = "";
+
+      if (entry.obj && typeof entry.obj === "object") {
+
+        const editor = createJsonTreeEditor(entry.obj);
+
+        treeArea.append(editor.container);
+
+        const applyBtn = el("button", { textContent: "Apply edits" }, { padding: "6px", marginTop: "8px", background: "#2a7", color: "#061" });
+
+        applyBtn.onclick = () => {
+
+          entry.obj = editor.getEdited();
+
+          decodedArea.innerText = JSON.stringify(entry.obj, null, 2);
+
+          alert("Applied edits to entry. Now compress & send using Binary tab.");
+
+        };
+
+        treeArea.append(applyBtn);
+
+      } else {
+
+        const ta = el("textarea", { value: entry.decodedText || (typeof entry.raw === "string" ? entry.raw : "") }, { width: "100%", height: "240px", background: "#020203", color: "#dfe", padding: "8px", fontFamily: "monospace" });
+
+        treeArea.append(ta);
+
+        const applyBtn = el("button", { textContent: "Apply text to entry" }, { padding: "6px", marginTop: "8px", background: "#2a7", color: "#061" });
+
+        applyBtn.onclick = () => { entry.obj = ta.value; alert("Applied text"); };
+
+        treeArea.append(applyBtn);
+
+      }
+
+
+
+      // binary area: choose compression, framing, socket selection and send
+
+      binaryArea.innerHTML = "";
+
+      binaryArea.append(el("div", { innerText: `Entry: ${entry.id} • Source: ${entry.source} • Decoded: ${entry.decodedMethod || "—"}` }, { fontWeight: 700 }));
+
+      const methodSel = el("select", {}, { padding: "6px", marginTop: "8px" });
+
+      ["zlib", "deflate", "gzip", "none"].forEach(m => methodSel.append(el("option", { value: m, textContent: m })));
+
+      methodSel.value = settings.preferCompression;
+
+      const sockWrapChk = el("input", { type: "checkbox" }, {});
+
+      const sockWrapLab = el("label", { innerText: "Wrap SockJS a[\"...\"]" }, { marginLeft: "8px", color: "#9aa" });
+
+      sockWrapLab.prepend(sockWrapChk);
+
+
+
+      // socket selection
+
+      const socketSel = el("select", {}, { padding: "6px", marginLeft: "8px" });
+
+      function refreshSocketOptions() {
+
+        socketSel.innerHTML = "";
+
+        const arr = Array.from(State.sockets);
+
+        if (!arr.length) socketSel.append(el("option", { value: "", textContent: "No WS captured" }));
+
+        for (const s of arr) {
+
+          const id = s.__RAIN_SOCKET_ID__ || "ws?";
+
+          const opt = el("option", { value: id, textContent: `${id} ${s.__RAIN_SOCKET_URL__ ? "• " + s.__RAIN_SOCKET_URL__ : ""}` });
+
+          socketSel.append(opt);
+
+        }
+
+      }
+
+      refreshSocketOptions();
+
+
+
+      const sendBtn = el("button", { textContent: "Encode & Send" }, { padding: "6px", background: "#3a7", color: "#0af", marginLeft: "8px" });
+
+      sendBtn.onclick = async () => {
+
+        try {
+
+          await loadPako(() => {}); // ensure loaded
+
+          const method = methodSel.value;
+
+          let toEncode;
+
+          if (entry.obj !== undefined && entry.obj !== null) toEncode = entry.obj;
+
+          else if (entry.decodedText) toEncode = entry.decodedText;
+
+          else if (entry.raw && typeof entry.raw === "string") toEncode = entry.raw;
+
+          else return alert("No payload to encode");
+
+
+
+          let bytes;
+
+          if (method === "none") {
+
+            const text = typeof toEncode === "string" ? toEncode : JSON.stringify(toEncode);
+
+            bytes = new TextEncoder().encode(text);
+
+          } else {
+
+            bytes = BlueBox.encodeJson(toEncode, method);
+
+          }
+
+
+
+          if (sockWrapChk.checked) {
+
+            // wrap bytes into a["<base64>"] text frame
+
+            const framed = BlueBox.wrapSockJs(bytes);
+
+            // send framed as text on selected socket
+
+            const arr = Array.from(State.sockets);
+
+            const sidx = arr.findIndex(s => s.__RAIN_SOCKET_ID__ === socketSel.value);
+
+            const ws = sidx >= 0 ? arr[sidx] : arr[0];
+
+            if (!ws) return alert("No socket to send to");
+
+            ws.send(framed);
+
+            alert("Sent SockJS-framed base64 text to socket");
+
+            return;
+
+          } else {
+
+            // send raw bytes (Uint8Array) to socket
+
+            const arr = Array.from(State.sockets);
+
+            const sidx = arr.findIndex(s => s.__RAIN_SOCKET_ID__ === socketSel.value);
+
+            const ws = sidx >= 0 ? arr[sidx] : arr[0];
+
+            if (!ws) return alert("No socket to send to");
+
+            ws.send(bytes);
+
+            alert("Sent compressed bytes to socket");
+
+            return;
+
+          }
+
+        } catch (e) {
+
+          alert("Encode/send failed: " + e.message);
+
+        }
+
+      };
+
+
+
+      binaryArea.append(el("div", {}, { marginTop: "8px" }, ));
+
+      binaryArea.append(el("div", {}, {}));
+
+      binaryArea.append(methodSel, sockWrapLab, socketSel, sendBtn);
+
+
+
+      // replay area: choose messages and replay to socket
+
+      replayArea.innerHTML = "";
+
+      replayArea.append(el("div", { innerText: "Replay Tool" }, { fontWeight: 700 }));
+
+      const msgsList = el("div", {}, { maxHeight: "200px", overflow: "auto", marginTop: "6px" });
+
+      replayArea.append(msgsList);
+
+      const entries = State.messages.slice(); // static capture
+
+      for (const m of entries) {
+
+        const r = el("div", {}, { padding: "6px", borderBottom: "1px solid #111", display: "flex", justifyContent: "space-between" });
+
+        r.append(el("div", { innerText: `[${new Date(m.ts).toLocaleTimeString()}] ${m.source} ${m.decodedMethod || ""}` }, {}));
+
+        const cb = el("input", { type: "checkbox" }, {});
+
+        r.append(cb);
+
+        msgsList.append(r);
+
+      }
+
+      const replayDelayInput = el("input", { value: settings.replayDelay, type: "number" }, { width: "80px", marginTop: "8px" });
+
+      const loopChk = el("input", { type: "checkbox" }, {});
+
+      const replayStart = el("button", { textContent: "Start Replay" }, { marginLeft: "8px", padding: "6px", background: "#2a7", color: "#061" });
+
+      replayStart.onclick = async () => {
+
+        const arr = [];
+
+        const children = msgsList.children;
+
+        for (let i = 0; i < children.length; i++) { if (children[i].querySelector("input").checked) arr.push(entries[i]); }
+
+        const arrSockets = Array.from(State.sockets);
+
+        const ws = arrSockets[0];
+
+        if (!ws) return alert("No socket captured to replay to");
+
+        await replay(arr, { delay: Number(replayDelayInput.value || settings.replayDelay), loop: !!loopChk.checked, socket: ws });
+
+      };
+
+      replayArea.append(el("div", {}, { marginTop: "8px" }, ), el("label", { innerText: "Delay (ms): " }), replayDelayInput, el("label", {}, { marginLeft: "8px" }, ), el("label", { innerText: "Loop: " }), loopChk, replayStart);
+
+
+
+      // show Binary tab
+
+      showTab("Binary");
+
+    }
+
+
+
+    // drag & position handling (simple)
+
+    (function makeDraggable(node) {
+
+      let dragging = false, startX = 0, startY = 0, origLeft = 0, origTop = 0;
+
+      node.addEventListener("mousedown", (e) => {
+
+        if (e.target.tagName === "BUTTON" || e.target.tagName === "INPUT" || e.target.tagName === "SELECT" || e.target.tagName === "TEXTAREA") return;
+
+        dragging = true;
+
+        startX = e.clientX;
+
+        startY = e.clientY;
+
+        origLeft = node.offsetLeft;
+
+        origTop = node.offsetTop;
+
+      });
+
+      window.addEventListener("mousemove", (e) => {
+
+        if (!dragging) return;
+
+        node.style.left = (origLeft + (e.clientX - startX)) + "px";
+
+        node.style.top = (origTop + (e.clientY - startY)) + "px";
+
+        node.style.right = "auto";
+
+        node.style.bottom = "auto";
+
+      });
+
+      window.addEventListener("mouseup", () => { dragging = false; });
+
+    })(panel);
+
+
+
+    document.body.append(panel);
+
+    return panel;
+
+  }
+
+
+
+  // create UI and bind events
+
+  const ui = createUI();
+
+
+
+  // wire bus to update UI when message captured
+
+  busOn("messageCaptured", (entry) => {
+
+    // simply trigger list refresh
+
+    // small debounce to avoid thrash
+
+    if (ui._refreshTimeout) clearTimeout(ui._refreshTimeout);
+
+    ui._refreshTimeout = setTimeout(() => {
+
+      const filterEl = ui.querySelector("input[placeholder]"); // hacky but works
+
+      filterEl && filterEl.dispatchEvent(new Event("input"));
+
+    }, 50);
+
+  });
+
+
+
+  // expose some API for advanced usage from console
+
+  window.RainOverlay = {
+
+    State,
+
+    BlueBox,
+
+    settings,
+
+    saveSettings,
+
+    loadSettings,
+
+    openUI: () => {
+
+      if (!document.getElementById(PANEL_ID)) createUI();
+
+    },
+
+    decodeBuffer: (raw) => BlueBox.decodeBuffer(raw),
+
+    encodeJson: (obj, method) => BlueBox.encodeJson(obj, method),
+
+  };
+
+
+
+  // initial message to console
+
+  log("Rain Overlay userscript initialized. Call window.RainOverlay.openUI() to re-open, or inspect window.RainOverlay.");
+
+
+
+})();
