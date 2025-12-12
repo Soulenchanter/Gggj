@@ -1,0 +1,267 @@
+// ==UserScript==
+// @name         Mini Chrome Console + Iframe Context + postMessage Tool
+// @namespace    devtools.enhanced
+// @match        *://*/*
+// @run-at       document-end
+// @grant        unsafeWindow
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    /**********************************
+     * AUTO SHOW OVERLAY ON PAGE LOAD
+     **********************************/
+    setTimeout(initOverlay, 800);
+
+    function initOverlay() {
+        if (document.body.dataset.miniConsoleLoaded) return;
+        document.body.dataset.miniConsoleLoaded = "1";
+
+        buildUI();
+        refreshIframeList();
+    }
+
+    /**********************************
+     * UI PANEL
+     **********************************/
+    let activeContext = window;  // current JS execution window
+    let framesList = [];         // collected iframe window references
+
+    let panel, output, input, runButton, iframeSelect, pmTargetSelect, pmInput, pmSend;
+
+    function buildUI() {
+        panel = document.createElement("div");
+        panel.style = `
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            width: 540px;
+            height: 300px;
+            background: #000;
+            color: #0f0;
+            font-family: monospace;
+            border-top: 2px solid #0f0;
+            z-index: 999999999;
+            padding: 6px;
+            resize: both;
+            overflow: auto;
+        `;
+
+        panel.innerHTML = `
+            <div id="mcc-header" style="cursor:move;font-weight:bold;margin-bottom:4px">
+                Mini Console + iframe Context + postMessage
+            </div>
+
+            <!-- IFRAME CONTEXT SELECTOR -->
+            <label style="color:#0f0">Context:</label>
+            <select id="mcc-iframe-select" style="background:#111;color:#0f0;border:1px solid #090;margin-bottom:6px"></select>
+
+            <!-- OUTPUT -->
+            <div id="mcc-output" style="
+                height:120px;
+                overflow:auto;
+                white-space:pre-wrap;
+                border:1px solid #0f0;
+                padding:4px;
+                background:#020;
+                margin-bottom:4px;
+            "></div>
+
+            <!-- INPUT -->
+            <textarea id="mcc-input" style="
+                width:100%;
+                height:60px;
+                background:#111;
+                color:#0f0;
+                border:1px solid #090;
+                padding:4px;
+                font-family:monospace;
+            "></textarea>
+
+            <button id="mcc-run" style="margin-top:5px;background:#060;color:#fff;padding:4px 10px">Run</button>
+
+            <hr style="border-color:#0f0">
+
+            <!-- POSTMESSAGE TOOL -->
+            <div style="font-weight:bold;margin-top:4px">postMessage Tool</div>
+            <label>Target frame:</label>
+            <select id="pm-target" style="background:#111;color:#0f0;border:1px solid #090"></select>
+            <br>
+
+            <textarea id="pm-input" placeholder='{"cmd":"ping"}' style="
+                width:100%;
+                height:45px;
+                background:#111;color:#0f0;border:1px solid #090;margin-top:4px;
+            "></textarea>
+
+            <button id="pm-send" style="margin-top:5px;background:#036;color:#fff;padding:4px 10px">
+                postMessage â send
+            </button>
+        `;
+
+        document.body.appendChild(panel);
+
+        output     = panel.querySelector("#mcc-output");
+        input      = panel.querySelector("#mcc-input");
+        runButton  = panel.querySelector("#mcc-run");
+        iframeSelect = panel.querySelector("#mcc-iframe-select");
+
+        pmTargetSelect = panel.querySelector("#pm-target");
+        pmInput = panel.querySelector("#pm-input");
+        pmSend  = panel.querySelector("#pm-send");
+
+        enableDragging();
+        attachConsoleRun();
+        attachPostMessageTool();
+
+        window.addEventListener("message", receivePostMessage);
+    }
+
+    /**********************************
+     * DRAGGING
+     **********************************/
+    function enableDragging() {
+        const header = panel.querySelector("#mcc-header");
+        let drag = false, x=0, y=0, startLeft=0, startTop=0;
+
+        header.addEventListener("mousedown", e => {
+            drag = true;
+            x = e.clientX;
+            y = e.clientY;
+            const rect = panel.getBoundingClientRect();
+            startLeft = rect.left;
+            startTop = rect.top;
+        });
+
+        document.addEventListener("mousemove", e => {
+            if (!drag) return;
+            panel.style.left = startLeft + (e.clientX - x) + "px";
+            panel.style.top  = startTop  + (e.clientY - y) + "px";
+        });
+
+        document.addEventListener("mouseup", () => drag = false);
+    }
+
+    /**********************************
+     * IFRAME CONTEXT SWITCHING
+     **********************************/
+    function refreshIframeList() {
+        framesList = [{ label: "Top Window", win: window }];
+
+        const all = document.querySelectorAll("iframe");
+        let index = 1;
+
+        all.forEach((frame) => {
+            try {
+                if (!frame.contentWindow) return;
+
+                let sameOrigin = false;
+                try { frame.contentWindow.document; sameOrigin = true; } catch {}
+
+                framesList.push({
+                    label: sameOrigin ?
+                        `iframe[${index}] (same-origin)` :
+                        `iframe[${index}] (cross-origin)`,
+                    win: frame.contentWindow
+                });
+
+                index++;
+            } catch {}
+        });
+
+        iframeSelect.innerHTML = "";
+        pmTargetSelect.innerHTML = "";
+
+        framesList.forEach((f, i) => {
+            const opt = document.createElement("option");
+            opt.value = i;
+            opt.textContent = f.label;
+            iframeSelect.appendChild(opt);
+
+            const opt2 = document.createElement("option");
+            opt2.value = i;
+            opt2.textContent = f.label;
+            pmTargetSelect.appendChild(opt2);
+        });
+
+        activeContext = window;
+    }
+
+    iframeSelect?.addEventListener("change", () => {
+        const idx = parseInt(iframeSelect.value);
+        activeContext = framesList[idx].win;
+
+        output.innerText += `Switched context â ${framesList[idx].label}\n`;
+        output.scrollTop = output.scrollHeight;
+    });
+
+    /**********************************
+     * LIVE JS EVALUATION
+     **********************************/
+    function attachConsoleRun() {
+        function runCode() {
+            const code = input.value;
+            input.value = "";
+
+            try {
+                const result =
+                    unsafeWindow && activeContext === window
+                        ? unsafeWindow.eval(code)
+                        : activeContext.eval(code);
+
+                log("> " + String(result));
+            } catch (err) {
+                log("ERROR: " + err.message);
+            }
+        }
+
+        runButton.onclick = runCode;
+
+        input.addEventListener("keydown", e => {
+            if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                runCode();
+            }
+        });
+    }
+
+    function log(msg) {
+        output.innerText += msg + "\n";
+        output.scrollTop = output.scrollHeight;
+    }
+
+    /**********************************
+     * POSTMESSAGE TOOL
+     **********************************/
+    function attachPostMessageTool() {
+        pmSend.addEventListener("click", () => {
+            const idx = parseInt(pmTargetSelect.value);
+            const frame = framesList[idx].win;
+
+            let msg;
+            try {
+                msg = JSON.parse(pmInput.value);
+            } catch {
+                log("postMessage: Invalid JSON");
+                return;
+            }
+
+            try {
+                frame.postMessage(msg, "*");
+                log(`postMessage â sent to ${framesList[idx].label}`);
+            } catch (err) {
+                log("postMessage ERROR: " + err);
+            }
+        });
+    }
+
+    function receivePostMessage(e) {
+        try {
+            log("postMessage â received: " + JSON.stringify(e.data));
+        } catch {
+            log("postMessage â received (non-serializable)");
+        }
+    }
+
+})();
