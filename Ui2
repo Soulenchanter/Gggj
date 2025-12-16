@@ -1,1346 +1,240 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>iframe Script Executor - Live Site Context</title>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            padding: 20px;
-        }
-
-        /* Overlay Styles */
-        .overlay {
-            position: fixed;
-            bottom: 20px;
-            right: 20px;
-            width: 700px;
-            height: 600px;
-            background: white;
-            border-radius: 12px;
-            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
-            display: flex;
-            flex-direction: column;
-            z-index: 10000;
-            overflow: hidden;
-            transition: all 0.3s ease;
-        }
-
-        .overlay.minimized {
-            width: auto;
-            height: auto;
-            bottom: 20px;
-            right: 20px;
-        }
-
-        .overlay-header {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            padding: 15px 20px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            cursor: move;
-            user-select: none;
-            border-radius: 12px 12px 0 0;
-        }
-
-        .overlay.minimized .overlay-header {
-            border-radius: 50%;
-            width: 50px;
-            height: 50px;
-            padding: 0;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-        }
-
-        .overlay-title {
-            font-weight: 600;
-            font-size: 14px;
-        }
-
-        .overlay.minimized .overlay-title {
-            display: none;
-        }
-
-        .user-badge {
-            background: rgba(255, 255, 255, 0.2);
-            padding: 4px 10px;
-            border-radius: 12px;
-            font-size: 11px;
-            font-weight: 500;
-            margin-left: auto;
-        }
-
-        .overlay.minimized .user-badge {
-            display: none;
-        }
-
-        .overlay-controls {
-            display: flex;
-            gap: 10px;
-            align-items: center;
-        }
-
-        .overlay.minimized .overlay-controls button:not(.minimize-btn) {
-            display: none;
-        }
-
-        button {
-            background: none;
-            border: none;
-            color: white;
-            cursor: pointer;
-            font-size: 16px;
-            padding: 5px 10px;
-            border-radius: 4px;
-            transition: background 0.2s;
-        }
-
-        button:hover {
-            background: rgba(255, 255, 255, 0.2);
-        }
-
-        .resize-handle {
-            position: absolute;
-            bottom: 0;
-            right: 0;
-            width: 20px;
-            height: 20px;
-            cursor: nwse-resize;
-            background: linear-gradient(135deg, transparent 50%, #667eea 50%);
-            border-radius: 0 0 12px 0;
-        }
-
-        .overlay.minimized .resize-handle {
-            display: none;
-        }
-
-        /* Content Area */
-        .overlay-content {
-            flex: 1;
-            display: flex;
-            flex-direction: column;
-            overflow: hidden;
-            background: white;
-            padding: 20px;
-            gap: 15px;
-        }
-
-        .overlay.minimized .overlay-content {
-            display: none;
-        }
-
-        /* Tabs */
-        .tabs {
-            display: flex;
-            gap: 5px;
-            border-bottom: 2px solid #e0e0e0;
-        }
-
-        .tab-btn {
-            background: none;
-            border: none;
-            padding: 10px 15px;
-            cursor: pointer;
-            color: #999;
-            font-weight: 500;
-            font-size: 13px;
-            border-bottom: 2px solid transparent;
-            transition: all 0.2s;
-        }
-
-        .tab-btn.active {
-            color: #667eea;
-            border-bottom-color: #667eea;
-        }
-
-        .tab-content {
-            display: none;
-            flex: 1;
-            overflow-y: auto;
-            flex-direction: column;
-            gap: 15px;
-        }
-
-        .tab-content.active {
-            display: flex;
-        }
-
-        /* Context Selector */
-        .context-selector {
-            display: flex;
-            gap: 10px;
-            align-items: center;
-        }
-
-        .context-selector label {
-            font-weight: 500;
-            color: #333;
-            font-size: 13px;
-            white-space: nowrap;
-        }
-
-        .context-selector select {
-            flex: 1;
-            padding: 8px 12px;
-            border: 2px solid #e0e0e0;
-            border-radius: 6px;
-            font-size: 13px;
-            background: white;
-            cursor: pointer;
-            transition: border-color 0.2s;
-        }
-
-        .context-selector select:hover {
-            border-color: #667eea;
-        }
-
-        .context-selector select:focus {
-            outline: none;
-            border-color: #667eea;
-            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
-        }
-
-        /* Execution Mode */
-        .execution-mode {
-            display: flex;
-            gap: 10px;
-            align-items: center;
-        }
-
-        .execution-mode label {
-            font-weight: 500;
-            color: #333;
-            font-size: 13px;
-        }
-
-        .radio-group {
-            display: flex;
-            gap: 15px;
-        }
-
-        .radio-group label {
-            display: flex;
-            align-items: center;
-            gap: 5px;
-            font-weight: 400;
-            cursor: pointer;
-            font-size: 13px;
-        }
-
-        .radio-group input[type="radio"] {
-            cursor: pointer;
-            width: 14px;
-            height: 14px;
-        }
-
-        /* Script Textarea */
-        .script-input {
-            flex: 1;
-            display: flex;
-            flex-direction: column;
-            gap: 8px;
-            min-height: 0;
-        }
-
-        .script-input label {
-            font-weight: 500;
-            color: #333;
-            font-size: 13px;
-        }
-
-        .script-input textarea {
-            flex: 1;
-            padding: 12px;
-            border: 2px solid #e0e0e0;
-            border-radius: 6px;
-            font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
-            font-size: 12px;
-            resize: none;
-            background: #f5f5f5;
-            transition: border-color 0.2s;
-            min-height: 0;
-        }
-
-        .script-input textarea:focus {
-            outline: none;
-            border-color: #667eea;
-            background: white;
-        }
-
-        /* Live Insert */
-        .live-insert-panel {
-            gap: 12px;
-        }
-
-        .live-insert-section {
-            display: flex;
-            flex-direction: column;
-            gap: 8px;
-        }
-
-        .live-insert-section h4 {
-            color: #333;
-            font-size: 12px;
-            font-weight: 600;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-        }
-
-        .quick-snippet-btn {
-            padding: 8px 12px;
-            background: #f0f0f0;
-            border: 1px solid #e0e0e0;
-            border-radius: 6px;
-            cursor: pointer;
-            font-size: 12px;
-            color: #333;
-            font-weight: 500;
-            transition: all 0.2s;
-            text-align: left;
-        }
-
-        .quick-snippet-btn:hover {
-            background: #e8e8e8;
-            border-color: #667eea;
-        }
-
-        .quick-snippet-btn.active {
-            background: #667eea;
-            color: white;
-            border-color: #667eea;
-        }
-
-        .live-insert-input {
-            display: flex;
-            gap: 8px;
-        }
-
-        .live-insert-input input {
-            flex: 1;
-            padding: 8px 12px;
-            border: 2px solid #e0e0e0;
-            border-radius: 6px;
-            font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
-            font-size: 12px;
-            transition: border-color 0.2s;
-        }
-
-        .live-insert-input input:focus {
-            outline: none;
-            border-color: #667eea;
-        }
-
-        .live-insert-input button {
-            padding: 8px 12px;
-            background: #667eea;
-            border: none;
-            border-radius: 6px;
-            color: white;
-            cursor: pointer;
-            font-weight: 500;
-            font-size: 12px;
-            transition: all 0.2s;
-        }
-
-        .live-insert-input button:hover {
-            background: #764ba2;
-            transform: translateY(-2px);
-        }
-
-        .code-preview {
-            background: #2d2d2d;
-            color: #f8f8f2;
-            padding: 12px;
-            border-radius: 6px;
-            font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
-            font-size: 11px;
-            overflow-x: auto;
-            max-height: 120px;
-            overflow-y: auto;
-            border: 1px solid #444;
-            word-break: break-all;
-            white-space: pre-wrap;
-        }
-
-        /* Log Panel */
-        .log-panel {
-            flex-direction: column;
-            gap: 10px;
-        }
-
-        .log-entries {
-            flex: 1;
-            overflow-y: auto;
-            border: 1px solid #e0e0e0;
-            border-radius: 6px;
-            background: #f9f9f9;
-            min-height: 0;
-        }
-
-        .log-entry {
-            padding: 10px 12px;
-            border-bottom: 1px solid #e0e0e0;
-            font-size: 12px;
-            font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
-        }
-
-        .log-entry:last-child {
-            border-bottom: none;
-        }
-
-        .log-entry.success {
-            background: #d4edda;
-            color: #155724;
-        }
-
-        .log-entry.error {
-            background: #f8d7da;
-            color: #721c24;
-        }
-
-        .log-entry.info {
-            background: #d1ecf1;
-            color: #0c5460;
-        }
-
-        .log-entry.warning {
-            background: #fff3cd;
-            color: #856404;
-        }
-
-        .log-timestamp {
-            opacity: 0.7;
-            font-size: 10px;
-        }
-
-        /* Communication Panel */
-        .communication-panel {
-            flex-direction: column;
-            gap: 10px;
-        }
-
-        .comm-status {
-            padding: 12px;
-            background: #d1ecf1;
-            border: 1px solid #bee5eb;
-            border-radius: 6px;
-            font-size: 12px;
-            color: #0c5460;
-        }
-
-        .comm-status.connected {
-            background: #d4edda;
-            border-color: #c3e6cb;
-            color: #155724;
-        }
-
-        .comm-items {
-            flex: 1;
-            overflow-y: auto;
-            border: 1px solid #e0e0e0;
-            border-radius: 6px;
-            background: #f9f9f9;
-            min-height: 0;
-        }
-
-        .comm-item {
-            padding: 10px 12px;
-            border-bottom: 1px solid #e0e0e0;
-            font-size: 11px;
-            font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
-        }
-
-        .comm-item:last-child {
-            border-bottom: none;
-        }
-
-        .comm-item.sent {
-            background: #e3f2fd;
-        }
-
-        .comm-item.received {
-            background: #f3e5f5;
-        }
-
-        .comm-direction {
-            color: #667eea;
-            font-weight: 600;
-        }
-
-        /* Action Buttons */
-        .action-buttons {
-            display: flex;
-            gap: 10px;
-        }
-
-        .action-buttons button {
-            flex: 1;
-            padding: 10px 16px;
-            border: none;
-            border-radius: 6px;
-            font-weight: 500;
-            font-size: 13px;
-            cursor: pointer;
-            transition: all 0.2s;
-            color: white;
-        }
-
-        .action-buttons .execute-btn {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        }
-
-        .action-buttons .execute-btn:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 10px 20px rgba(102, 126, 234, 0.3);
-        }
-
-        .action-buttons .reload-inject-btn {
-            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
-        }
-
-        .action-buttons .reload-inject-btn:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 10px 20px rgba(245, 87, 108, 0.3);
-        }
-
-        .action-buttons .clear-btn {
-            background: #e0e0e0;
-            color: #333;
-        }
-
-        .action-buttons .clear-btn:hover {
-            background: #d0d0d0;
-        }
-
-        .action-buttons .clear-log-btn {
-            background: #ff6b6b;
-        }
-
-        .action-buttons .clear-log-btn:hover {
-            background: #ff5252;
-        }
-
-        /* Status Messages */
-        .status-message {
-            padding: 10px 12px;
-            border-radius: 6px;
-            font-size: 12px;
-            display: none;
-            animation: slideIn 0.3s ease;
-        }
-
-        .status-message.show {
-            display: block;
-        }
-
-        .status-message.success {
-            background: #d4edda;
-            color: #155724;
-            border: 1px solid #c3e6cb;
-        }
-
-        .status-message.error {
-            background: #f8d7da;
-            color: #721c24;
-            border: 1px solid #f5c6cb;
-        }
-
-        .status-message.info {
-            background: #d1ecf1;
-            color: #0c5460;
-            border: 1px solid #bee5eb;
-        }
-
-        @keyframes slideIn {
-            from {
-                opacity: 0;
-                transform: translateY(-10px);
-            }
-            to {
-                opacity: 1;
-                transform: translateY(0);
-            }
-        }
-
-        .context-info {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 10px;
-            padding: 12px;
-            background: #f5f5f5;
-            border-radius: 6px;
-            font-size: 11px;
-        }
-
-        .context-info-item {
-            display: flex;
-            flex-direction: column;
-            gap: 4px;
-        }
-
-        .context-info-label {
-            color: #666;
-            font-weight: 600;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-        }
-
-        .context-info-value {
-            color: #333;
-            font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
-            word-break: break-all;
-        }
-    </style>
-</head>
-<body>
-    <!-- Overlay -->
-    <div class="overlay" id="overlay">
-        <div class="overlay-header" id="overlayHeader">
-            <span class="overlay-title">⚙️ Script Executor</span>
-            <span class="user-badge">👤 Soulenchanter | 2025-12-16</span>
-            <div class="overlay-controls">
-                <button class="minimize-btn" id="minimizeBtn" title="Minimize">−</button>
-                <button id="closeBtn" title="Close">×</button>
-            </div>
+(function () {
+    'use strict';
+
+    /* ============================================================
+       CONFIG (ANONYMOUS)
+    ============================================================ */
+    const CONFIG = {
+        version: '2.1.0',
+        date: '2025-12-16',
+        autoPopup: true,
+        popupDelay: 50,
+        storageScripts: 'se_scripts_anonymous',
+        storageSnippets: 'se_snippets_anonymous',
+        onloadDelay: 800,
+        isMobile: /Android|iPhone|iPad/i.test(navigator.userAgent)
+    };
+
+    /* ============================================================
+       STATE
+    ============================================================ */
+    const state = {
+        selectedContext: null,
+        frames: {},
+        scripts: {},
+        snippets: {}
+    };
+
+    /* ============================================================
+       UTILS
+    ============================================================ */
+    const Utils = {
+        uuid: () => crypto.randomUUID(),
+        time: () => new Date().toLocaleTimeString(),
+        load: k => {
+            try { return JSON.parse(localStorage.getItem(k)) || {}; }
+            catch { return {}; }
+        },
+        save: (k, v) => {
+            try { localStorage.setItem(k, JSON.stringify(v)); }
+            catch {}
+        },
+        download(content, name) {
+            const b = new Blob([content], { type: 'text/javascript' });
+            const u = URL.createObjectURL(b);
+            const a = document.createElement('a');
+            a.href = u;
+            a.download = name;
+            a.click();
+            URL.revokeObjectURL(u);
+        }
+    };
+
+    /* ============================================================
+       STYLES (FULL ORIGINAL RESTORED)
+    ============================================================ */
+    const style = document.createElement('style');
+    style.textContent = `
+    .se-overlay{position:fixed;bottom:10px;right:10px;width:90vw;max-width:500px;height:70vh;background:#fff;
+    border-radius:14px;box-shadow:0 25px 50px rgba(0,0,0,.3);z-index:999999;display:flex;flex-direction:column;
+    font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif}
+    .se-header{background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;padding:12px 15px;
+    font-weight:700;border-radius:14px 14px 0 0}
+    .se-tabs{display:flex;border-bottom:2px solid #e5e7eb}
+    .se-tab{flex:1;padding:10px;border:none;background:none;font-weight:600;cursor:pointer}
+    .se-tab.active{color:#667eea;border-bottom:3px solid #667eea}
+    .se-content{flex:1;overflow:auto;padding:12px}
+    textarea,input,select{width:100%;margin-top:6px;padding:10px;border-radius:8px;border:2px solid #e5e7eb}
+    textarea{font-family:monospace;min-height:120px}
+    button{padding:8px 12px;border-radius:8px;border:none;font-weight:600;cursor:pointer}
+    .primary{background:#667eea;color:#fff}
+    .secondary{background:#f3f4f6}
+    .list-item{padding:8px;border:1px solid #e5e7eb;border-radius:6px;margin-bottom:6px}
+    .log{font-family:monospace;font-size:11px}
+    `;
+    document.head.appendChild(style);
+
+    /* ============================================================
+       UI
+    ============================================================ */
+    const ui = document.createElement('div');
+    ui.className = 'se-overlay';
+    ui.innerHTML = `
+        <div class="se-header">⚙️ Script Executor Pro</div>
+
+        <div class="se-tabs">
+            <button class="se-tab active" data-tab="exec">Execute</button>
+            <button class="se-tab" data-tab="snippets">Snippets</button>
+            <button class="se-tab" data-tab="files">Files</button>
+            <button class="se-tab" data-tab="log">Log</button>
         </div>
 
-        <div class="overlay-content">
-            <!-- Tabs -->
-            <div class="tabs">
-                <button class="tab-btn active" data-tab="script">Script Input</button>
-                <button class="tab-btn" data-tab="live">Live Insert</button>
-                <button class="tab-btn" data-tab="log">Execution Log</button>
-                <button class="tab-btn" data-tab="comm">Communications</button>
-            </div>
-
-            <!-- Tab 1: Script Input -->
-            <div class="tab-content active script-panel" id="script-tab">
-                <div class="context-selector">
-                    <label for="contextSelect">Context/Frame:</label>
-                    <select id="contextSelect">
-                        <option value="">Select a context...</option>
-                    </select>
-                </div>
-
-                <div class="context-info" id="contextInfo" style="display: none;">
-                    <div class="context-info-item">
-                        <span class="context-info-label">Frame Name</span>
-                        <span class="context-info-value" id="infoFrameName">-</span>
-                    </div>
-                    <div class="context-info-item">
-                        <span class="context-info-label">Frame URL</span>
-                        <span class="context-info-value" id="infoFrameUrl">-</span>
-                    </div>
-                    <div class="context-info-item">
-                        <span class="context-info-label">Accessible</span>
-                        <span class="context-info-value" id="infoAccessible">-</span>
-                    </div>
-                    <div class="context-info-item">
-                        <span class="context-info-label">Connection</span>
-                        <span class="context-info-value" id="infoConnection">-</span>
-                    </div>
-                </div>
-
-                <div class="execution-mode">
-                    <label>Execution Method:</label>
-                    <div class="radio-group">
-                        <label>
-                            <input type="radio" name="executionMode" value="reload" checked>
-                            Reload & Inject
-                        </label>
-                        <label>
-                            <input type="radio" name="executionMode" value="onload">
-                            On Load (1s)
-                        </label>
-                        <label>
-                            <input type="radio" name="executionMode" value="onidle">
-                            On Idle (20s)
-                        </label>
-                    </div>
-                </div>
-
-                <div class="script-input">
-                    <label for="scriptTextarea">Script:</label>
-                    <textarea id="scriptTextarea" placeholder="// Paste your script here&#10;// Will be executed with full parent-child communication&#10;// Example: console.log('Hello from iframe!');"></textarea>
-                </div>
-
-                <div class="status-message" id="statusMessage"></div>
-
-                <div class="action-buttons">
-                    <button class="reload-inject-btn" id="reloadInjectBtn">🔄 Reload & Inject</button>
-                    <button class="execute-btn" id="executeBtn">▶ Execute</button>
-                    <button class="clear-btn" id="clearBtn">Clear</button>
-                </div>
-            </div>
-
-            <!-- Tab 2: Live Insert -->
-            <div class="tab-content live-insert-panel" id="live-tab">
-                <div class="live-insert-section">
-                    <h4>Quick Snippets</h4>
-                    <button class="quick-snippet-btn" data-snippet="console.log('Frame:', window.name || 'top', 'User: Soulenchanter', 'Date:', new Date().toISOString());">📝 Log Frame Info</button>
-                    <button class="quick-snippet-btn" data-snippet="document.body.style.backgroundColor = '#fff3cd'; console.log('BG changed to yellow');">🎨 Yellow BG</button>
-                    <button class="quick-snippet-btn" data-snippet="document.body.insertAdjacentHTML('afterbegin', '<div style=\"background: #667eea; color: white; padding: 20px; text-align: center; border-radius: 8px; margin: 10px;\"><h2>🚀 Live Injected by ' + (window.__SCRIPT_EXECUTOR_USER || 'Soulenchanter') + '</h2></div>');">🚀 Insert Banner</button>
-                    <button class="quick-snippet-btn" data-snippet="console.log('All elements in frame:', document.querySelectorAll('*').length); console.log('Current URL:', window.location.href);">📊 Page Stats</button>
-                </div>
-
-                <div class="live-insert-section">
-                    <h4>Custom Script</h4>
-                    <div class="live-insert-input">
-                        <input type="text" id="liveScriptInput" placeholder="Enter JavaScript code...">
-                        <button id="liveInsertBtn">Insert Live</button>
-                    </div>
-                </div>
-
-                <div class="live-insert-section">
-                    <h4>Code Preview</h4>
-                    <div class="code-preview" id="codePreview">// Code preview will appear here...</div>
-                </div>
-            </div>
-
-            <!-- Tab 3: Execution Log -->
-            <div class="tab-content log-panel" id="log-tab">
-                <div class="log-entries" id="logEntries">
-                    <div class="log-entry info">
-                        <span class="log-timestamp">[System]</span> Executor initialized | User: Soulenchanter | Date: 2025-12-16
-                    </div>
-                </div>
-
-                <div class="action-buttons">
-                    <button class="clear-log-btn" id="clearLogBtn">Clear Log</button>
-                </div>
-            </div>
-
-            <!-- Tab 4: Communications -->
-            <div class="tab-content communication-panel" id="comm-tab">
-                <div class="comm-status" id="commStatus">
-                    🔴 No connections active
-                </div>
-
-                <div class="comm-items" id="commItems">
-                    <div class="comm-item info">
-                        <span class="log-timestamp">[System]</span> Communication channel initialized. Listening for postMessage events...
-                    </div>
-                </div>
-
-                <div class="action-buttons">
-                    <button class="clear-log-btn" id="clearCommBtn" style="flex: 1;">Clear</button>
-                </div>
-            </div>
+        <div class="se-content" id="exec-tab">
+            <select id="ctx"></select>
+            <textarea id="code">// JavaScript here</textarea>
+            <button class="primary" id="run">Execute</button>
         </div>
 
-        <div class="resize-handle" id="resizeHandle"></div>
-    </div>
+        <div class="se-content" id="snippets-tab" style="display:none">
+            <input id="snipName" placeholder="Snippet name">
+            <textarea id="snipCode"></textarea>
+            <button class="primary" id="saveSnippet">Save Snippet</button>
+            <div id="snipList"></div>
+        </div>
 
-    <script>
-        // State Management
-        const state = {
-            selectedContext: null,
-            executionMode: 'reload',
-            idleTimer: null,
-            idleThreshold: 20000,
-            onloadDelay: 1000,
-            dragging: false,
-            resizing: false,
-            offsetX: 0,
-            offsetY: 0,
-            user: 'Soulenchanter',
-            date: '2025-12-16',
-            frames: {},
-            connectedFrames: new Set()
+        <div class="se-content" id="files-tab" style="display:none">
+            <input id="fileName" placeholder="Script name">
+            <button class="primary" id="saveFile">Save Script</button>
+            <div id="fileList"></div>
+        </div>
+
+        <div class="se-content log" id="log-tab" style="display:none"></div>
+    `;
+    document.body.appendChild(ui);
+
+    /* ============================================================
+       TABS
+    ============================================================ */
+    document.querySelectorAll('.se-tab').forEach(b => {
+        b.onclick = () => {
+            document.querySelectorAll('.se-tab').forEach(x => x.classList.remove('active'));
+            document.querySelectorAll('.se-content').forEach(x => x.style.display = 'none');
+            b.classList.add('active');
+            document.getElementById(b.dataset.tab + '-tab').style.display = 'block';
         };
+    });
 
-        // DOM Elements
-        const overlay = document.getElementById('overlay');
-        const overlayHeader = document.getElementById('overlayHeader');
-        const contextSelect = document.getElementById('contextSelect');
-        const scriptTextarea = document.getElementById('scriptTextarea');
-        const executeBtn = document.getElementById('executeBtn');
-        const reloadInjectBtn = document.getElementById('reloadInjectBtn');
-        const clearBtn = document.getElementById('clearBtn');
-        const minimizeBtn = document.getElementById('minimizeBtn');
-        const closeBtn = document.getElementById('closeBtn');
-        const statusMessage = document.getElementById('statusMessage');
-        const resizeHandle = document.getElementById('resizeHandle');
-        const logEntries = document.getElementById('logEntries');
-        const clearLogBtn = document.getElementById('clearLogBtn');
-        const liveScriptInput = document.getElementById('liveScriptInput');
-        const liveInsertBtn = document.getElementById('liveInsertBtn');
-        const codePreview = document.getElementById('codePreview');
-        const commItems = document.getElementById('commItems');
-        const commStatus = document.getElementById('commStatus');
-        const clearCommBtn = document.getElementById('clearCommBtn');
-        const contextInfo = document.getElementById('contextInfo');
+    /* ============================================================
+       LOGGER
+    ============================================================ */
+    const log = msg => {
+        const l = document.getElementById('log-tab');
+        l.innerHTML += `[${Utils.time()}] ${msg}<br>`;
+        l.scrollTop = l.scrollHeight;
+    };
 
-        // Initialize
-        function init() {
-            injectFrameCommunicationScript();
-            discoverContexts();
-            setupEventListeners();
-            setupOverlayControls();
-            setupResizeListener();
-            setupTabs();
-            setupLiveInsert();
-            addLog('System initialized. All frames detected and injected with communication layer.', 'info');
+    /* ============================================================
+       EXECUTION
+    ============================================================ */
+    document.getElementById('run').onclick = () => {
+        const ctx = state.selectedContext;
+        const code = document.getElementById('code').value;
+        if (!ctx || !code) return;
+
+        if (ctx === 'top') {
+            try { eval(code); log('Executed in top'); }
+            catch (e) { log(e.message); }
+            return;
         }
 
-        // Inject Communication Script into All Frames
-        function injectFrameCommunicationScript() {
-            const commScript = `
-                window.__SCRIPT_EXECUTOR_USER = '${state.user}';
-                window.__SCRIPT_EXECUTOR_DATE = '${state.date}';
-                window.__FRAME_COMMUNICATION = {
-                    ready: true,
-                    frameId: '${generateFrameId()}',
-                    scripts: [],
-                    pendingResponse: null
-                };
+        state.frames[ctx].contentWindow.postMessage({
+            type: 'INJECT',
+            id: Utils.uuid(),
+            code
+        }, '*');
+    };
 
-                // Setup message listener
-                window.addEventListener('message', function(event) {
-                    try {
-                        const data = event.data;
-                        
-                        if(data.type === 'INJECT_SCRIPT') {
-                            window.__FRAME_COMMUNICATION.scripts.push({
-                                id: data.id,
-                                script: data.script,
-                                executionMode: data.executionMode,
-                                timestamp: data.timestamp
-                            });
-
-                            try {
-                                eval(data.script);
-                                window.parent.postMessage({
-                                    type: 'SCRIPT_SUCCESS',
-                                    id: data.id,
-                                    frame: data.frame,
-                                    frameId: window.__FRAME_COMMUNICATION.frameId,
-                                    message: 'Script executed successfully',
-                                    executionMode: data.executionMode,
-                                    user: data.user,
-                                    timestamp: new Date().toISOString()
-                                }, '*');
-                            } catch(err) {
-                                window.parent.postMessage({
-                                    type: 'SCRIPT_ERROR',
-                                    id: data.id,
-                                    frame: data.frame,
-                                    frameId: window.__FRAME_COMMUNICATION.frameId,
-                                    message: err.message,
-                                    stack: err.stack,
-                                    executionMode: data.executionMode,
-                                    timestamp: new Date().toISOString()
-                                }, '*');
-                            }
-                        }
-                        
-                        if(data.type === 'PING') {
-                            window.parent.postMessage({
-                                type: 'PONG',
-                                frame: window.name || 'top',
-                                frameId: window.__FRAME_COMMUNICATION.frameId,
-                                url: window.location.href,
-                                timestamp: new Date().toISOString()
-                            }, '*');
-                        }
-                    } catch(e) {
-                        console.error('[Frame Communication Error]', e);
-                    }
-                });
-
-                // Signal ready
-                window.parent.postMessage({
-                    type: 'FRAME_READY',
-                    frame: window.name || 'top',
-                    frameId: window.__FRAME_COMMUNICATION.frameId,
-                    url: window.location.href,
-                    timestamp: new Date().toISOString()
-                }, '*');
+    /* ============================================================
+       SNIPPETS
+    ============================================================ */
+    function renderSnippets() {
+        const box = document.getElementById('snipList');
+        box.innerHTML = '';
+        Object.entries(state.snippets).forEach(([n, c]) => {
+            const d = document.createElement('div');
+            d.className = 'list-item';
+            d.innerHTML = `
+                <strong>${n}</strong>
+                <button class="secondary">Load</button>
+                <button class="primary">Run</button>
             `;
-
-            // Inject into all current iframes
-            document.querySelectorAll('iframe').forEach(iframe => {
-                try {
-                    if(iframe.contentWindow) {
-                        iframe.contentWindow.eval(commScript);
-                    }
-                } catch(e) {
-                    console.warn('Could not inject into iframe:', iframe.name || iframe.id, e);
-                }
-            });
-
-            // Monitor for new iframes
-            const observer = new MutationObserver((mutations) => {
-                mutations.forEach((mutation) => {
-                    mutation.addedNodes.forEach((node) => {
-                        if(node.tagName === 'IFRAME') {
-                            setTimeout(() => {
-                                try {
-                                    if(node.contentWindow) {
-                                        node.contentWindow.eval(commScript);
-                                    }
-                                } catch(e) {
-                                    console.warn('Could not inject into new iframe:', node.name, e);
-                                }
-                            }, 100);
-                        }
-                    });
-                });
-            });
-
-            observer.observe(document.documentElement, {
-                childList: true,
-                subtree: true
-            });
-        }
-
-        // Generate Unique Frame ID
-        function generateFrameId() {
-            return 'frame_' + Math.random().toString(36).substr(2, 9);
-        }
-
-        // Discover Available Contexts/Frames
-        function discoverContexts() {
-            const contexts = [];
-
-            contexts.push({
-                name: 'top',
-                label: '🌐 Top Window',
-                window: window,
-                url: window.location.href,
-                accessible: true
-            });
-
-            const frames = document.querySelectorAll('iframe');
-            frames.forEach((iframe, index) => {
-                const frameName = iframe.name || iframe.id || `Frame ${index + 1}`;
-                let accessible = false;
-                let url = 'N/A';
-
-                try {
-                    if(iframe.contentWindow && iframe.contentWindow.location) {
-                        url = iframe.contentWindow.location.href;
-                        accessible = true;
-                    }
-                } catch(e) {
-                    // Cross-origin iframe
-                }
-
-                state.frames[frameName] = {
-                    element: iframe,
-                    accessible: accessible,
-                    url: url
-                };
-
-                contexts.push({
-                    name: frameName,
-                    label: `📦 ${frameName}`,
-                    window: null,
-                    url: url,
-                    accessible: accessible
-                });
-            });
-
-            contexts.forEach(context => {
-                const option = document.createElement('option');
-                option.value = context.name;
-                option.textContent = context.label;
-                option.dataset.url = context.url;
-                option.dataset.accessible = context.accessible;
-                contextSelect.appendChild(option);
-            });
-
-            addLog(`Discovered ${frames.length} iframe(s) + top window = ${contexts.length} total contexts`, 'info');
-        }
-
-        // Setup Event Listeners
-        function setupEventListeners() {
-            contextSelect.addEventListener('change', (e) => {
-                state.selectedContext = e.target.value;
-                
-                if(state.selectedContext === 'top') {
-                    contextInfo.style.display = 'none';
-                } else {
-                    updateContextInfo();
-                    contextInfo.style.display = 'grid';
-                }
-
-                resetIdleTimer();
-                showStatus(`Context: ${state.selectedContext || 'None'}`, 'info');
-            });
-
-            document.querySelectorAll('input[name="executionMode"]').forEach(radio => {
-                radio.addEventListener('change', (e) => {
-                    state.executionMode = e.target.value;
-                    resetIdleTimer();
-                    addLog(`Execution mode: ${state.executionMode}`, 'info');
-                });
-            });
-
-            executeBtn.addEventListener('click', executeScript);
-            reloadInjectBtn.addEventListener('click', executeWithReload);
-            clearBtn.addEventListener('click', () => {
-                scriptTextarea.value = '';
-                showStatus('Script cleared', 'info');
-            });
-
-            clearLogBtn.addEventListener('click', () => {
-                logEntries.innerHTML = '';
-                addLog('Log cleared by user', 'info');
-            });
-
-            clearCommBtn.addEventListener('click', () => {
-                commItems.innerHTML = '';
-                addLog('Communication log cleared', 'info');
-            });
-
-            document.addEventListener('mousemove', resetIdleTimer);
-            document.addEventListener('keypress', resetIdleTimer);
-        }
-
-        // Update Context Info
-        function updateContextInfo() {
-            const frameName = state.selectedContext;
-            const frameData = state.frames[frameName];
-
-            if(frameData) {
-                document.getElementById('infoFrameName').textContent = frameName;
-                document.getElementById('infoFrameUrl').textContent = frameData.url;
-                document.getElementById('infoAccessible').textContent = frameData.accessible ? '✓ Yes' : '✗ No (Cross-origin)';
-                document.getElementById('infoConnection').textContent = state.connectedFrames.has(frameName) ? '🟢 Connected' : '🔴 Pending';
-            }
-        }
-
-        // Setup Tabs
-        function setupTabs() {
-            document.querySelectorAll('.tab-btn').forEach(btn => {
-                btn.addEventListener('click', () => {
-                    const tabName = btn.dataset.tab;
-                    
-                    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-                    document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-                    
-                    btn.classList.add('active');
-                    document.getElementById(tabName + '-tab').classList.add('active');
-                });
-            });
-        }
-
-        // Setup Live Insert
-        function setupLiveInsert() {
-            const snippets = document.querySelectorAll('.quick-snippet-btn');
-            snippets.forEach(btn => {
-                btn.addEventListener('click', () => {
-                    const snippet = btn.dataset.snippet;
-                    liveScriptInput.value = snippet;
-                    codePreview.textContent = snippet;
-                    
-                    snippets.forEach(b => b.classList.remove('active'));
-                    btn.classList.add('active');
-                });
-            });
-
-            liveScriptInput.addEventListener('input', (e) => {
-                codePreview.textContent = e.target.value || '// Code preview will appear here...';
-            });
-
-            liveInsertBtn.addEventListener('click', () => {
-                const script = liveScriptInput.value.trim();
-                if (!script) {
-                    showStatus('Script cannot be empty', 'error');
-                    return;
-                }
-
-                if (!state.selectedContext) {
-                    showStatus('Please select a context first', 'error');
-                    return;
-                }
-
-                executeLiveScript(script);
-            });
-        }
-
-        // Execute Script
-        async function executeScript() {
-            if (!state.selectedContext) {
-                showStatus('Please select a context first', 'error');
-                return;
-            }
-
-            const script = scriptTextarea.value.trim();
-            if (!script) {
-                showStatus('Script cannot be empty', 'error');
-                return;
-            }
-
-            executeInContext(script, false);
-        }
-
-        // Execute with Reload and Inject
-        async function executeWithReload() {
-            if (!state.selectedContext) {
-                showStatus('Please select a context first', 'error');
-                return;
-            }
-
-            const script = scriptTextarea.value.trim();
-            if (!script) {
-                showStatus('Script cannot be empty', 'error');
-                return;
-            }
-
-            if (state.selectedContext === 'top') {
-                showStatus('Cannot reload top window. Use Execute instead.', 'error');
-                return;
-            }
-
-            const iframe = state.frames[state.selectedContext]?.element;
-            if (!iframe) {
-                showStatus(`Frame "${state.selectedContext}" not found`, 'error');
-                return;
-            }
-
-            showStatus('Reloading iframe and injecting script...', 'info');
-            addLog(`Reloading iframe "${state.selectedContext}"...`, 'warning');
-
-            const srcDoc = iframe.getAttribute('srcdoc');
-            const src = iframe.getAttribute('src');
-
-            iframe.onload = () => {
-                addLog(`Frame "${state.selectedContext}" reloaded, injecting script...`, 'info');
-                setTimeout(() => {
-                    executeInIframe(iframe, script, false);
-                }, state.onloadDelay);
-            };
-
-            if (srcDoc) {
-                iframe.setAttribute('srcdoc', srcDoc);
-            } else if (src) {
-                iframe.src = src;
-            } else {
-                showStatus('Cannot reload: no src or srcdoc found', 'error');
-            }
-        }
-
-        // Execute in Context
-        function executeInContext(script, live = false) {
-            try {
-                if (state.selectedContext === 'top') {
-                    eval(script);
-                    showStatus('✓ Script executed in top window', 'success');
-                    addLog(`Script executed in top window by ${state.user}`, 'success');
-                } else {
-                    const iframe = state.frames[state.selectedContext]?.element;
-                    if (iframe) {
-                        executeInIframe(iframe, script, live);
-                    }
-                }
-            } catch (error) {
-                showStatus(`Error: ${error.message}`, 'error');
-                addLog(`Execution error: ${error.message}`, 'error');
-            }
-        }
-
-        // Execute Script in iframe
-        function executeInIframe(iframe, script, live = false) {
-            try {
-                const scriptId = 'script_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
-                iframe.contentWindow.postMessage({
-                    type: 'INJECT_SCRIPT',
-                    id: scriptId,
-                    script: script,
-                    frame: state.selectedContext,
-                    executionMode: state.executionMode,
-                    live: live,
-                    user: state.user,
-                    timestamp: new Date().toISOString()
-                }, '*');
-
-                showStatus(`✓ Script injected into ${state.selectedContext}`, 'success');
-                addLog(`Script injected into ${state.selectedContext} [${scriptId.substr(0, 12)}...]`, 'info');
-            } catch (error) {
-                showStatus(`Injection error: ${error.message}`, 'error');
-                addLog(`Injection error: ${error.message}`, 'error');
-            }
-        }
-
-        // Execute Live Script
-        function executeLiveScript(script) {
-            try {
-                if (state.selectedContext === 'top') {
-                    eval(script);
-                    showStatus('✓ Live script executed in top window', 'success');
-                    addLog(`Live script executed in top window by ${state.user}`, 'success');
-                } else {
-                    const iframe = state.frames[state.selectedContext]?.element;
-                    if (iframe) {
-                        executeInIframe(iframe, script, true);
-                    }
-                }
-            } catch (error) {
-                showStatus(`✗ Error: ${error.message}`, 'error');
-                addLog(`Live script error: ${error.message}`, 'error');
-            }
-        }
-
-        // Listen for messages from iframes
-        window.addEventListener('message', (event) => {
-            const data = event.data;
-
-            if (data.type === 'FRAME_READY') {
-                state.connectedFrames.add(data.frame);
-                addLog(`🟢 Frame ready: "${data.frame}" [${data.frameId}] | URL: ${data.url}`, 'success');
-                updateCommStatus();
-                addComm(`RECEIVED: Frame Ready from "${data.frame}"`, 'received');
-                updateContextInfo();
-            }
-
-            if (data.type === 'SCRIPT_SUCCESS') {
-                showStatus(`✓ ${data.frame}: Success`, 'success');
-                addLog(`[${data.frame}] ✓ ${data.message} (${data.executionMode})`, 'success');
-                addComm(`RECEIVED: Success from "${data.frame}" [${data.id?.substr(0, 12)}...]`, 'received');
-            }
-
-            if (data.type === 'SCRIPT_ERROR') {
-                showStatus(`✗ ${data.frame}: ${data.message}`, 'error');
-                addLog(`[${data.frame}] ✗ Error: ${data.message}`, 'error');
-                addComm(`RECEIVED: Error from "${data.frame}": ${data.message}`, 'received');
-            }
-
-            if (data.type === 'PONG') {
-                addComm(`RECEIVED: Pong from "${data.frame}"`, 'received');
-            }
+            const [l, r] = d.querySelectorAll('button');
+            l.onclick = () => document.getElementById('code').value = c;
+            r.onclick = () => eval(c);
+            box.appendChild(d);
         });
+    }
 
-        // Setup Overlay Controls
-        function setupOverlayControls() {
-            overlayHeader.addEventListener('mousedown', (e) => {
-                if (e.target.tagName === 'BUTTON') return;
-                state.dragging = true;
-                state.offsetX = e.clientX - overlay.offsetLeft;
-                state.offsetY = e.clientY - overlay.offsetTop;
-            });
+    document.getElementById('saveSnippet').onclick = () => {
+        const n = snipName.value.trim();
+        const c = snipCode.value.trim();
+        if (!n || !c) return;
+        state.snippets[n] = c;
+        Utils.save(CONFIG.storageSnippets, state.snippets);
+        renderSnippets();
+        log(`Snippet saved: ${n}`);
+    };
 
-            document.addEventListener('mousemove', (e) => {
-                if (state.dragging && !overlay.classList.contains('minimized')) {
-                    overlay.style.left = (e.clientX - state.offsetX) + 'px';
-                    overlay.style.top = (e.clientY - state.offsetY) + 'px';
-                    overlay.style.right = 'auto';
-                    overlay.style.bottom = 'auto';
-                }
-            });
+    /* ============================================================
+       FILES
+    ============================================================ */
+    function renderFiles() {
+        const box = document.getElementById('fileList');
+        box.innerHTML = '';
+        Object.entries(state.scripts).forEach(([n, c]) => {
+            const d = document.createElement('div');
+            d.className = 'list-item';
+            d.innerHTML = `<strong>${n}</strong>
+                <button class="secondary">Load</button>`;
+            d.querySelector('button').onclick = () =>
+                document.getElementById('code').value = c;
+            box.appendChild(d);
+        });
+    }
 
-            document.addEventListener('mouseup', () => {
-                state.dragging = false;
-            });
+    document.getElementById('saveFile').onclick = () => {
+        const n = fileName.value.trim();
+        const c = code.value.trim();
+        if (!n || !c) return;
+        state.scripts[n] = c;
+        Utils.save(CONFIG.storageScripts, state.scripts);
+        renderFiles();
+        log(`Script saved: ${n}`);
+    };
 
-            minimizeBtn.addEventListener('click', () => {
-                overlay.classList.toggle('minimized');
-                minimizeBtn.textContent = overlay.classList.contains('minimized') ? '+' : '−';
-            });
+    /* ============================================================
+       CONTEXT DISCOVERY
+    ============================================================ */
+    const ctxSel = document.getElementById('ctx');
+    ctxSel.innerHTML = '<option value="">Select context</option>';
+    ctxSel.add(new Option('Top Window', 'top'));
 
-            closeBtn.addEventListener('click', () => {
-                overlay.style.display = 'none';
-            });
+    document.querySelectorAll('iframe').forEach((f, i) => {
+        const name = f.name || `Frame_${i + 1}`;
+        state.frames[name] = f;
+        ctxSel.add(new Option(name, name));
+    });
 
-            overlay.addEventListener('click', (e) => {
-                if (overlay.classList.contains('minimized') && e.target === overlay) {
-                    overlay.classList.remove('minimized');
-                    minimizeBtn.textContent = '−';
-                }
-            });
-        }
+    ctxSel.onchange = e => state.selectedContext = e.target.value;
 
-        // Setup Resize Listener
-        function setupResizeListener() {
-            resizeHandle.addEventListener('mousedown', (e) => {
-                state.resizing = true;
-                const startX = e.clientX;
-                const startY = e.clientY;
-                const startWidth = overlay.offsetWidth;
-                const startHeight = overlay.offsetHeight;
+    /* ============================================================
+       LOAD STORAGE
+    ============================================================ */
+    state.scripts = Utils.load(CONFIG.storageScripts);
+    state.snippets = Utils.load(CONFIG.storageSnippets);
+    renderFiles();
+    renderSnippets();
 
-                const handleMouseMove = (moveEvent) => {
-                    if (state.resizing) {
-                        const newWidth = Math.max(400, startWidth + (moveEvent.clientX - startX));
-                        const newHeight = Math.max(300, startHeight + (moveEvent.clientY - startY));
-                        overlay.style.width = newWidth + 'px';
-                        overlay.style.height = newHeight + 'px';
-                    }
-                };
+    log(`Initialized v${CONFIG.version} (anonymous)`);
 
-                const handleMouseUp = () => {
-                    state.resizing = false;
-                    document.removeEventListener('mousemove', handleMouseMove);
-                    document.removeEventListener('mouseup', handleMouseUp);
-                };
-
-                document.addEventListener('mousemove', handleMouseMove);
-                document.addEventListener('mouseup', handleMouseUp);
-            });
-        }
-
-        // Idle Timer
-        function resetIdleTimer() {
-            clearTimeout(state.idleTimer);
-        }
-
-        // Show Status Message
-        function showStatus(message, type) {
-            statusMessage.textContent = message;
-            statusMessage.className = `status-message show ${type}`;
-            setTimeout(() => {
-                statusMessage.classList.remove('show');
-            }, 4000);
-        }
-
-        // Add Log Entry
-        function addLog(message, type = 'info') {
-            const entry = document.createElement('div');
-            entry.className = `log-entry ${type}`;
-            const time = new Date().toLocaleTimeString();
-            entry.innerHTML = `<span class="log-timestamp">[${time}]</span> ${message}`;
-            logEntries.appendChild(entry);
-            logEntries.scrollTop = logEntries.scrollHeight;
-        }
-
-        // Add Communication Entry
-        function addComm(message, direction = 'sent') {
-            const entry = document.createElement('div');
-            entry.className = `comm-item ${direction}`;
-            const time = new Date().toLocaleTimeString();
-            const dir = direction === 'sent' ? '📤 SENT' : '📥 RECEIVED';
-            entry.innerHTML = `<span class="log-timestamp">[${time}]</span> <span class="comm-direction">${dir}:</span> ${message}`;
-            commItems.appendChild(entry);
-            commItems.scrollTop = commItems.scrollHeight;
-        }
-
-        // Update Communication Status
-        function updateCommStatus() {
-            const connected = state.connectedFrames.size;
-            if (connected > 0) {
-                commStatus.innerHTML = `🟢 Connected to ${connected} frame(s)`;
-                commStatus.className = 'comm-status connected';
-            } else {
-                commStatus.innerHTML = `🔴 No connections active`;
-                commStatus.className = 'comm-status';
-            }
-        }
-
-        // Initialize on page load
-        window.addEventListener('load', init);
-    </script>
-</body>
-</html>
+})();
