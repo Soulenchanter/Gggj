@@ -1,224 +1,287 @@
 (function () {
-    'use strict';
+'use strict';
 
-    /* ============================================================
-       CONFIG
-    ============================================================ */
-    const CONFIG = {
-        version: '2.4.0',
-        storageScripts: 'se_scripts_anonymous',
-        storageSnippets: 'se_snippets_anonymous',
-        iframePollInterval: 3000,
+/* ============================================================
+   SCRIPT EXECUTOR PRO — FINAL
+   ============================================================ */
 
-        // Optional auto-sync (public RAW GitHub URL)
-        autoSyncGitHub: true,
-        githubSnippetsRawUrl: '', // <-- paste RAW github snippets.js here
-    };
+/* ================= CONFIG ================= */
+const CONFIG = {
+    storageKey: 'se_snippets_final',
+    githubTokenKey: 'se_github_token',
+    githubApi: 'https://api.github.com',
+    repoDir: 'script-executor',
+    autoSyncOnLoad: true,
+    autoSyncDelay: 1500,
+    idleDelay: 20000
+};
 
-    /* ============================================================
-       STATE
-    ============================================================ */
-    const state = {
-        selectedContext: null,
-        executionMode: 'top',
-        frames: {},
-        scripts: {},
-        snippets: {}
-    };
+/* ================= STATE ================= */
+const state = {
+    snippets: {},
+    frames: {},
+    idleTimer: null,
+    github: {
+        user: null,
+        repos: [],
+        repo: null,
+        branch: 'main',
+        autoSync: true
+    }
+};
 
-    /* ============================================================
-       UTILS
-    ============================================================ */
-    const Utils = {
-        time: () => new Date().toLocaleTimeString(),
-        load: k => {
-            try { return JSON.parse(localStorage.getItem(k)) || {}; }
-            catch { return {}; }
-        },
-        save: (k, v) => {
-            try { localStorage.setItem(k, JSON.stringify(v)); }
-            catch {}
-        },
-        async loadFromGitHub(rawUrl) {
-            const r = await fetch(rawUrl, { cache: 'no-store' });
-            const t = await r.text();
-            const mod = {};
-            new Function('module', t + ';return module.exports||exports?.default')(mod);
-            return mod.exports || mod.default || {};
-        },
-        frameLabel(frame, index) {
-            try {
-                const w = frame.contentWindow;
-                return w.document.title || new URL(w.location.href).hostname;
-            } catch {
-                return frame.name || frame.id || `Frame_${index + 1}`;
-            }
-        }
-    };
+/* ================= UTILS ================= */
+const U = {
+    save() {
+        localStorage.setItem(CONFIG.storageKey, JSON.stringify(state.snippets));
+    },
+    load() {
+        return JSON.parse(localStorage.getItem(CONFIG.storageKey) || '{}');
+    },
+    token: {
+        get: () => localStorage.getItem(CONFIG.githubTokenKey),
+        set: t => t
+            ? localStorage.setItem(CONFIG.githubTokenKey, t)
+            : localStorage.removeItem(CONFIG.githubTokenKey)
+    },
+    log(msg, type = 'info') {
+        const el = document.createElement('div');
+        el.className = `log ${type}`;
+        el.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+        document.getElementById('log').appendChild(el);
+    },
+    b64enc(s) {
+        return btoa(unescape(encodeURIComponent(s)));
+    },
+    b64dec(s) {
+        return decodeURIComponent(escape(atob(s)));
+    }
+};
 
-    /* ============================================================
-       STYLES
-    ============================================================ */
-    const style = document.createElement('style');
-    style.textContent = `
-    .se-overlay{position:fixed;bottom:20px;right:20px;width:460px;height:560px;
-    background:#fff;border-radius:14px;box-shadow:0 25px 50px rgba(0,0,0,.35);
-    z-index:999999;font-family:-apple-system,BlinkMacSystemFont,Segoe UI;display:flex;flex-direction:column}
-    .se-header{background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;
-    padding:12px 14px;font-weight:700;border-radius:14px 14px 0 0;cursor:move}
-    .se-tabs{display:flex;border-bottom:2px solid #e5e7eb}
-    .se-tab{flex:1;padding:10px;border:none;background:none;font-weight:600;cursor:pointer}
-    .se-tab.active{color:#667eea;border-bottom:3px solid #667eea}
-    .se-content{flex:1;overflow:auto;padding:12px}
-    textarea,input,select{width:100%;margin-top:6px;padding:10px;border-radius:8px;border:2px solid #e5e7eb}
-    textarea{font-family:monospace;min-height:120px}
-    button{padding:8px 12px;border-radius:8px;border:none;font-weight:600;cursor:pointer}
-    .primary{background:#667eea;color:#fff}
-    .secondary{background:#f3f4f6}
-    .log{font-family:monospace;font-size:11px}
-    `;
-    document.head.appendChild(style);
+/* ================= EXECUTION ================= */
+function execute(code, ctx) {
+    try {
+        if (!ctx || ctx === 'top') eval(code);
+        else state.frames[ctx]?.contentWindow.eval(code);
+        U.log('Executed', 'ok');
+    } catch (e) {
+        U.log(e.message, 'err');
+    }
+}
 
-    /* ============================================================
-       UI
-    ============================================================ */
-    const ui = document.createElement('div');
-    ui.className = 'se-overlay';
-    ui.innerHTML = `
-        <div class="se-header">⚙️ Script Executor Pro</div>
-
-        <div class="se-tabs">
-            <button class="se-tab active" data-tab="exec">Execute</button>
-            <button class="se-tab" data-tab="snippets">Snippets</button>
-            <button class="se-tab" data-tab="log">Log</button>
-        </div>
-
-        <div class="se-content" id="exec-tab">
-            <select id="ctx"></select>
-            <select id="mode">
-                <option value="safe">Safe (eval)</option>
-                <option value="frame">Frame (direct)</option>
-                <option value="top">Top (direct)</option>
-                <option value="inject">Injected (script tag)</option>
-            </select>
-            <textarea id="code">// JavaScript here</textarea>
-            <button class="primary" id="run">Execute</button>
-        </div>
-
-        <div class="se-content" id="snippets-tab" style="display:none">
-            <div id="snipList"></div>
-        </div>
-
-        <div class="se-content log" id="log-tab" style="display:none"></div>
-    `;
-    document.body.appendChild(ui);
-
-    /* ============================================================
-       TABS
-    ============================================================ */
-    document.querySelectorAll('.se-tab').forEach(b => {
-        b.onclick = () => {
-            document.querySelectorAll('.se-tab').forEach(x => x.classList.remove('active'));
-            document.querySelectorAll('.se-content').forEach(x => x.style.display = 'none');
-            b.classList.add('active');
-            document.getElementById(b.dataset.tab + '-tab').style.display = 'block';
+/* ================= GITHUB ================= */
+const GitHub = {
+    headers() {
+        return {
+            Authorization: `token ${U.token.get()}`,
+            Accept: 'application/vnd.github+json'
         };
+    },
+
+    async api(path, opts = {}) {
+        const r = await fetch(CONFIG.githubApi + path, {
+            ...opts,
+            headers: { ...this.headers(), ...(opts.headers || {}) }
+        });
+        if (!r.ok) throw new Error(await r.text());
+        return r.json();
+    },
+
+    async connect() {
+        const t = prompt('Paste GitHub PAT (repo scope)');
+        if (!t) return;
+        U.token.set(t);
+        state.github.user = await this.api('/user');
+        state.github.repos = await this.api('/user/repos?per_page=100');
+        renderRepos();
+        U.log(`Connected as ${state.github.user.login}`, 'ok');
+    },
+
+    async push() {
+        if (!state.github.repo) return alert('Select repo');
+        for (const [name, s] of Object.entries(state.snippets)) {
+            const path = `${CONFIG.repoDir}/${name}.js`;
+            const content = U.b64enc(s.code);
+            let sha;
+
+            try {
+                const f = await this.api(`/repos/${state.github.repo}/contents/${path}?ref=${state.github.branch}`);
+                sha = f.sha;
+            } catch {}
+
+            await this.api(`/repos/${state.github.repo}/contents/${path}`, {
+                method: 'PUT',
+                body: JSON.stringify({
+                    message: `Update ${name}`,
+                    content,
+                    branch: state.github.branch,
+                    sha
+                })
+            });
+        }
+        U.log('Pushed to GitHub', 'ok');
+    },
+
+    async pull() {
+        if (!state.github.repo) return;
+        const files = await this.api(
+            `/repos/${state.github.repo}/contents/${CONFIG.repoDir}?ref=${state.github.branch}`
+        );
+
+        for (const f of files.filter(x => x.name.endsWith('.js'))) {
+            const data = await this.api(`/repos/${state.github.repo}/contents/${f.path}`);
+            const remote = U.b64dec(data.content);
+            const name = f.name.replace(/\.js$/, '');
+            const local = state.snippets[name]?.code;
+
+            if (!local || local === remote) {
+                state.snippets[name] = { code: remote };
+            } else {
+                Diff.prompt(name, local, remote);
+            }
+        }
+        U.save();
+        renderList();
+        U.log('Pull complete', 'ok');
+    }
+};
+
+/* ================= DIFF ================= */
+const Diff = {
+    prompt(name, local, remote) {
+        const w = window.open('', '_blank', 'width=900,height=600');
+        w.document.write(`
+<style>
+body{font-family:monospace;display:flex}
+pre{width:50%;padding:10px;overflow:auto}
+.l{background:#fee2e2}.r{background:#dcfce7}
+button{position:fixed;bottom:10px;left:10px}
+</style>
+<pre class="l">${esc(local)}</pre>
+<pre class="r">${esc(remote)}</pre>
+<button>Overwrite</button>
+`);
+        w.document.querySelector('button').onclick = () => {
+            state.snippets[name] = { code: remote };
+            U.save();
+            renderList();
+            w.close();
+        };
+    }
+};
+
+function esc(s) {
+    return s.replace(/[&<>]/g, c =>
+        ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c])
+    );
+}
+
+/* ================= UI ================= */
+function UI() {
+document.body.insertAdjacentHTML('beforeend', `
+<style>
+#se{position:fixed;bottom:10px;right:10px;width:420px;height:520px;
+background:#fff;border-radius:12px;box-shadow:0 20px 40px #0003;
+font-family:sans-serif;z-index:999999;display:flex;flex-direction:column}
+#se h{background:#6366f1;color:#fff;padding:10px;font-weight:700;cursor:move}
+#se c{flex:1;padding:10px;overflow:auto}
+textarea{width:100%;height:120px}
+.log.ok{color:green}.log.err{color:red}
+</style>
+
+<div id="se">
+<h>Script Executor Pro</h>
+<c>
+<input id="name" placeholder="Snippet name"><br>
+<textarea id="code"></textarea>
+<button id="save">Save</button>
+<button id="run">Run</button>
+<hr>
+<button id="gh">GitHub</button>
+<button id="push">Push</button>
+<button id="pull">Pull</button>
+<button id="autosync">AutoSync: ON</button>
+<br>
+<select id="repo"></select>
+<input id="branch" value="main">
+<hr>
+<div id="list"></div>
+<hr>
+<div id="log"></div>
+</c>
+</div>
+`);
+}
+
+/* ================= RENDER ================= */
+function renderList() {
+    const l = document.getElementById('list');
+    l.innerHTML = '';
+    Object.entries(state.snippets).forEach(([k, v]) => {
+        const d = document.createElement('div');
+        d.innerHTML = `<b>${k}</b> <button>▶</button> <button>✕</button>`;
+        const [r, x] = d.querySelectorAll('button');
+        r.onclick = () => execute(v.code, 'top');
+        x.onclick = () => {
+            delete state.snippets[k];
+            U.save();
+            renderList();
+        };
+        l.appendChild(d);
     });
+}
 
-    /* ============================================================
-       LOGGER
-    ============================================================ */
-    const log = msg => {
-        const l = document.getElementById('log-tab');
-        l.innerHTML += `[${Utils.time()}] ${msg}<br>`;
-        l.scrollTop = l.scrollHeight;
+function renderRepos() {
+    const s = document.getElementById('repo');
+    s.innerHTML = '';
+    state.github.repos.forEach(r => {
+        const o = document.createElement('option');
+        o.value = r.full_name;
+        o.textContent = r.full_name;
+        s.appendChild(o);
+    });
+    s.onchange = e => state.github.repo = e.target.value;
+    state.github.repo = s.value;
+}
+
+/* ================= AUTO SYNC ================= */
+async function autoSync() {
+    if (!CONFIG.autoSyncOnLoad) return;
+    if (!state.github.autoSync) return;
+    if (!U.token.get()) return;
+    try {
+        await GitHub.pull();
+        U.log('Auto-sync done', 'ok');
+    } catch (e) {
+        U.log('Auto-sync failed', 'err');
+    }
+}
+
+/* ================= INIT ================= */
+function init() {
+    UI();
+    state.snippets = U.load();
+    renderList();
+
+    document.getElementById('save').onclick = () => {
+        state.snippets[name.value] = { code: code.value };
+        U.save();
+        renderList();
     };
 
-    /* ============================================================
-       EXECUTION (MAX PERMISSIONS)
-    ============================================================ */
-    run.onclick = () => {
-        const codeVal = code.value;
-        const ctxVal = ctx.value;
-        const modeVal = mode.value;
-        if (!codeVal) return;
+    document.getElementById('run').onclick = () => execute(code.value, 'top');
+    document.getElementById('gh').onclick = () => GitHub.connect();
+    document.getElementById('push').onclick = () => GitHub.push();
+    document.getElementById('pull').onclick = () => GitHub.pull();
 
-        try {
-            if (modeVal === 'inject') {
-                const s = document.createElement('script');
-                s.textContent = codeVal;
-                document.documentElement.appendChild(s);
-                s.remove();
-                log('Injected into DOM (max permission)');
-                return;
-            }
-
-            if (modeVal === 'top' || ctxVal === 'top') {
-                window.eval(codeVal);
-                log('Executed in top window');
-                return;
-            }
-
-            if (modeVal === 'frame' && state.frames[ctxVal]) {
-                state.frames[ctxVal].contentWindow.eval(codeVal);
-                log(`Executed in frame: ${ctxVal}`);
-                return;
-            }
-
-            eval(codeVal);
-            log('Executed in safe mode');
-        } catch (e) {
-            log(e.message);
-        }
+    document.getElementById('autosync').onclick = e => {
+        state.github.autoSync = !state.github.autoSync;
+        e.target.textContent =
+            'AutoSync: ' + (state.github.autoSync ? 'ON' : 'OFF');
     };
 
-    /* ============================================================
-       SNIPPETS (AUTO GITHUB SYNC)
-    ============================================================ */
-    function renderSnippets() {
-        snipList.innerHTML = '';
-        Object.entries(state.snippets).forEach(([n, c]) => {
-            const d = document.createElement('div');
-            d.innerHTML = `<strong>${n}</strong><button class="secondary">Run</button>`;
-            d.querySelector('button').onclick = () => eval(c);
-            snipList.appendChild(d);
-        });
-    }
+    setTimeout(autoSync, CONFIG.autoSyncDelay);
+}
 
-    async function autoSync() {
-        if (!CONFIG.autoSyncGitHub || !CONFIG.githubSnippetsRawUrl) return;
-        try {
-            const data = await Utils.loadFromGitHub(CONFIG.githubSnippetsRawUrl);
-            Object.assign(state.snippets, data);
-            Utils.save(CONFIG.storageSnippets, state.snippets);
-            renderSnippets();
-            log('GitHub snippets synced');
-        } catch {
-            log('GitHub sync failed');
-        }
-    }
-
-    /* ============================================================
-       FRAMES
-    ============================================================ */
-    function discoverFrames() {
-        ctx.innerHTML = '<option value="top">Top Window</option>';
-        state.frames = {};
-        document.querySelectorAll('iframe').forEach((f, i) => {
-            const label = Utils.frameLabel(f, i);
-            state.frames[label] = f;
-            ctx.add(new Option(label, label));
-        });
-    }
-
-    /* ============================================================
-       INIT
-    ============================================================ */
-    state.snippets = Utils.load(CONFIG.storageSnippets);
-    renderSnippets();
-    discoverFrames();
-    autoSync();
-    setInterval(discoverFrames, CONFIG.iframePollInterval);
-    log(`Initialized v${CONFIG.version} (anonymous, max-permission)`);
-
+init();
 })();
