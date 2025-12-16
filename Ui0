@@ -1,6 +1,3 @@
-// /Ui.js
-// Mini DevTools+ Overlay v4.3 — Freeze-safe, multi-frame snippet execution
-
 (() => {
   "use strict";
 
