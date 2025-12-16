@@ -12,7 +12,7 @@
 
         // Optional auto-sync (public RAW GitHub URL)
         autoSyncGitHub: true,
-        githubSnippetsRawUrl: 'https://github.com/Soulenchanter/Gggj/blob/main/Ui7', // <-- paste RAW github snippets.js here
+        githubSnippetsRawUrl: 'https://github.com/Soulenchanter/Gggj/blob/main/Ui6', // <-- paste RAW github snippets.js here
     };
 
     /* ============================================================
