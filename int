@@ -1,0 +1,1235 @@
+// ==UserScript==
+// @name         Universal Network Interceptor (Core)
+// @namespace    https://example.local/
+// @version      2.0.0
+// @description  Full overlay: fetch/XHR/WS/STOMP patching, clone editor with ticked fields, base64 blob persistence, mobile friendly UI.
+// @match        *://*/*
+// @grant        none
+// @run-at       document-start
+// ==/UserScript==
+
+(() => {
+  "use strict";
+
+  // Prevent double load
+  if (window.__UNIVERSAL_NETWORK_INTERCEPTOR_LOADED__) return;
+  window.__UNIVERSAL_NETWORK_INTERCEPTOR_LOADED__ = true;
+
+  /**************************************************************************
+   * Config & Storage
+   **************************************************************************/
+  const STORAGE = {
+    CLONES: "uni_ni_clones_v2",
+    LOGS: "uni_ni_logs_v2",
+    SETTINGS: "uni_ni_settings_v2",
+    SNIPPETS: "uni_ni_snippets_v2"
+  };
+
+  const DEFAULTS = {
+    sizeLimitKB: 200,
+    maxLogs: 5000
+  };
+
+  /**************************************************************************
+   * Utilities: safe clone, base64 helpers, persistence
+   **************************************************************************/
+  function safeJSONParse(s) { try { return JSON.parse(s); } catch (e) { return null; } }
+  function uid() { return Math.random().toString(36).slice(2, 9); }
+  function nowIso() { return new Date().toISOString(); }
+
+  function blobToBase64(blob) {
+    return new Promise((resolve, reject) => {
+      try {
+        const fr = new FileReader();
+        fr.onload = () => resolve(fr.result.split(",")[1] || "");
+        fr.onerror = reject;
+        fr.readAsDataURL(blob);
+      } catch (e) { reject(e); }
+    });
+  }
+
+  function base64ToBlob(b64, type = "") {
+    try {
+      const bin = atob(b64);
+      const len = bin.length;
+      const arr = new Uint8Array(len);
+      for (let i = 0; i < len; i++) arr[i] = bin.charCodeAt(i);
+      return new Blob([arr], { type });
+    } catch (e) { return null; }
+  }
+
+  function safeClone(obj) {
+    if (obj === null || typeof obj !== "object") return obj;
+    if (obj instanceof Date) return new Date(obj);
+    if (Array.isArray(obj)) return obj.map(safeClone);
+    try {
+      if (typeof File !== "undefined" && obj instanceof File) {
+        return { __placeholder: true, kind: "File", name: obj.name, type: obj.type, size: obj.size, _replacementBase64: null };
+      }
+      if (typeof Blob !== "undefined" && obj instanceof Blob) {
+        return { __placeholder: true, kind: "Blob", type: obj.type || "", size: obj.size, _replacementBase64: null };
+      }
+      if (typeof Headers !== "undefined" && obj instanceof Headers) {
+        const out = {};
+        for (const k of obj.keys()) out[k] = obj.get(k);
+        return { __placeholder: true, kind: "Headers", headers: out };
+      }
+      if (obj instanceof ArrayBuffer || ArrayBuffer.isView(obj)) {
+        const len = obj.byteLength || (obj.buffer && obj.buffer.byteLength) || 0;
+        return { __placeholder: true, kind: "ArrayBuffer", byteLength: len };
+      }
+    } catch (e) {}
+    const out = {};
+    for (const k in obj) {
+      try { out[k] = safeClone(obj[k]); } catch (e) { out[k] = String(obj[k]); }
+    }
+    return out;
+  }
+
+  function revivePlaceholders(obj) {
+    if (obj === null || typeof obj !== "object") return obj;
+    if (Array.isArray(obj)) return obj.map(revivePlaceholders);
+    if (obj.__placeholder) {
+      if (obj._replacementBase64) {
+        return base64ToBlob(obj._replacementBase64, obj.type || "");
+      }
+      return obj;
+    }
+    const out = Array.isArray(obj) ? [] : {};
+    for (const k in obj) out[k] = revivePlaceholders(obj[k]);
+    return out;
+  }
+
+  function loadJSON(key, fallback) {
+    try { const raw = localStorage.getItem(key); return raw ? JSON.parse(raw) : fallback; } catch (e) { return fallback; }
+  }
+
+  function saveJSON(key, value) {
+    try { localStorage.setItem(key, JSON.stringify(value)); } catch (e) { console.warn("saveJSON fail", e); }
+  }
+
+  /**************************************************************************
+   * Storage: clones, logs, snippets, settings
+   **************************************************************************/
+  let CLONES = loadJSON(STORAGE.CLONES, []);
+  let LOGS = loadJSON(STORAGE.LOGS, []);
+  let SNIPPETS = loadJSON(STORAGE.SNIPPETS, {});
+  let SETTINGS = loadJSON(STORAGE.SETTINGS, { sizeLimitKB: DEFAULTS.sizeLimitKB });
+
+  function persistClones() { saveJSON(STORAGE.CLONES, CLONES); }
+  function persistLogs() { saveJSON(STORAGE.LOGS, LOGS.slice(-DEFAULTS.maxLogs)); }
+  function persistSnippets() { saveJSON(STORAGE.SNIPPETS, SNIPPETS); }
+  function persistSettings() { saveJSON(STORAGE.SETTINGS, SETTINGS); }
+
+  /**************************************************************************
+   * UI: Styles & Layout
+   **************************************************************************/
+  const styleStr = `
+    .ni-overlay { position: fixed; right: 12px; bottom: 12px; width: 96%; max-width: 1200px; height: 80vh; background: #0a0e0a; color: #d4f1d4; font-family: 'Courier New', monospace; z-index: 2147483647; border: 2px solid #2ecc71; border-radius: 8px; box-shadow: 0 8px 32px rgba(0,0,0,0.8); display: flex; flex-direction: column; overflow: hidden; }
+    .ni-header { background: #050a05; padding: 10px 12px; display: flex; align-items: center; gap: 12px; cursor: grab; user-select: none; border-bottom: 1px solid #2ecc71; }
+    .ni-header-title { flex: 1; font-weight: 700; color: #2ecc71; font-size: 16px; }
+    .ni-tabs { display: flex; gap: 6px; padding: 8px; background: #040704; border-bottom: 1px solid #1a3a1a; overflow-x: auto; }
+    .ni-tabs button { background: #0a0e0a; color: #aaa; border: 1px solid #2b6c3a; padding: 8px 12px; border-radius: 4px; cursor: pointer; font-size: 12px; transition: all 0.3s; }
+    .ni-tabs button:hover { background: #0f140f; color: #d4f1d4; border-color: #2ecc71; }
+    .ni-tabs button.active { background: #2ecc71; color: #000; }
+    .ni-content { flex: 1; display: flex; gap: 12px; padding: 12px; overflow: hidden; }
+    .ni-side { width: 380px; min-width: 280px; border-right: 1px solid #1a3a1a; overflow-y: auto; padding: 8px; }
+    .ni-main { flex: 1; padding: 8px; overflow-y: auto; }
+    .ni-modal { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); background: #0a0e0a; color: #d4f1d4; padding: 16px; border: 2px solid #2ecc71; border-radius: 8px; z-index: 2147483650; max-height: 85vh; overflow-y: auto; min-width: 400px; max-width: 800px; }
+    .ni-btn { background: #1a4d2e; color: #2ecc71; border: 1px solid #2ecc71; padding: 8px 12px; border-radius: 4px; cursor: pointer; font-size: 12px; transition: all 0.3s; }
+    .ni-btn:hover { background: #2ecc71; color: #000; }
+    .ni-btn:active { transform: scale(0.98); }
+    .ni-btn-danger { background: #4d1a1a; border-color: #ff4444; color: #ff4444; }
+    .ni-btn-danger:hover { background: #ff4444; color: #000; }
+    .ni-pre { background: #030504; padding: 8px; border-radius: 4px; white-space: pre-wrap; font-size: 11px; border-left: 2px solid #2ecc71; color: #a8e6a8; word-break: break-all; overflow-x: auto; }
+    .ni-input, .ni-textarea, .ni-select { background: #0f140f; color: #d4f1d4; border: 1px solid #2b6c3a; padding: 6px; border-radius: 4px; font-family: monospace; font-size: 12px; }
+    .ni-label { display: block; margin: 8px 0 4px 0; font-weight: 600; color: #2ecc71; }
+    .ni-checkbox { margin-right: 6px; }
+    .ni-modal h3 { color: #2ecc71; margin-top: 0; }
+    .ni-row { display: flex; gap: 8px; margin-bottom: 8px; }
+    @media (max-width: 800px) {
+      .ni-overlay { right: 6px; left: 6px; bottom: 6px; top: 6px; width: auto; height: 92vh; }
+      .ni-side { display: none; }
+      .ni-modal { min-width: 90vw; }
+    }
+  `;
+
+  const style = document.createElement("style");
+  style.textContent = styleStr;
+  document.documentElement.appendChild(style);
+
+  // Create overlay
+  const overlay = document.createElement("div");
+  overlay.className = "ni-overlay";
+  overlay.setAttribute("data-ni-overlay", "1");
+
+  // Header
+  const header = document.createElement("div");
+  header.className = "ni-header";
+  header.innerHTML = `
+    <div class="ni-header-title">🌐 Network Interceptor v2.0</div>
+    <div style="display: flex; gap: 6px; align-items: center;">
+      <button id="ni-minimize" class="ni-btn">Min</button>
+      <button id="ni-close" class="ni-btn">Close</button>
+    </div>
+  `;
+  overlay.appendChild(header);
+
+  // Tabs
+  const tabs = document.createElement("div");
+  tabs.className = "ni-tabs";
+  const tabNames = ["Logs", "Clones", "Editor", "Snippets", "Settings"];
+  const tabButtons = {};
+  tabNames.forEach(name => {
+    const b = document.createElement("button");
+    b.textContent = name;
+    b.className = name === "Logs" ? "active" : "";
+    b.onclick = () => { setActiveTab(name); };
+    tabs.appendChild(b);
+    tabButtons[name] = b;
+  });
+  overlay.appendChild(tabs);
+
+  // Content area
+  const content = document.createElement("div");
+  content.className = "ni-content";
+  const side = document.createElement("div"); 
+  side.className = "ni-side";
+  const main = document.createElement("div"); 
+  main.className = "ni-main";
+  content.appendChild(side);
+  content.appendChild(main);
+  overlay.appendChild(content);
+
+  document.body.appendChild(overlay);
+
+  // Draggable header
+  (function initDrag() {
+    let dragging = false, offsetX = 0, offsetY = 0;
+    header.addEventListener("mousedown", e => { 
+      dragging = true; 
+      offsetX = e.clientX - overlay.offsetLeft; 
+      offsetY = e.clientY - overlay.offsetTop; 
+      header.style.cursor = "grabbing"; 
+    });
+    window.addEventListener("mouseup", () => { 
+      dragging = false; 
+      header.style.cursor = "grab"; 
+    });
+    window.addEventListener("mousemove", e => { 
+      if (dragging) { 
+        overlay.style.left = (e.clientX - offsetX) + "px"; 
+        overlay.style.top = (e.clientY - offsetY) + "px"; 
+        overlay.style.right = "auto";
+        overlay.style.bottom = "auto";
+      } 
+    });
+    document.getElementById("ni-minimize").onclick = () => { 
+      overlay.style.display = "none"; 
+      createFloatingOpenButton(); 
+    };
+    document.getElementById("ni-close").onclick = () => { 
+      overlay.remove(); 
+      createFloatingOpenButton(); 
+    };
+  })();
+
+  // Floating open button
+  function createFloatingOpenButton() {
+    if (document.querySelector("[data-ni-openbutton]")) return;
+    const btn = document.createElement("button");
+    btn.setAttribute("data-ni-openbutton", "1");
+    btn.style.cssText = `
+      position: fixed;
+      bottom: 20px;
+      right: 20px;
+      z-index: 2147483647;
+      background: #1a4d2e;
+      color: #2ecc71;
+      border: 2px solid #2ecc71;
+      padding: 12px 16px;
+      border-radius: 6px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+    `;
+    btn.textContent = "🌐 Network Interceptor";
+    btn.onclick = () => {
+      if (!document.querySelector("[data-ni-overlay]")) document.body.appendChild(overlay);
+      overlay.style.display = "flex";
+      btn.remove();
+    };
+    document.body.appendChild(btn);
+  }
+
+  // Modal
+  const modal = document.createElement("div");
+  modal.className = "ni-modal";
+  modal.style.display = "none";
+  document.body.appendChild(modal);
+
+  function showModal(dom) { 
+    modal.innerHTML = ""; 
+    modal.style.display = "block"; 
+    modal.appendChild(dom); 
+  }
+
+  function hideModal() { 
+    modal.style.display = "none"; 
+    modal.innerHTML = ""; 
+  }
+
+  /**************************************************************************
+   * Log System
+   **************************************************************************/
+  function pushLog(line, type = "log", meta = {}) {
+    const entry = { ts: nowIso(), line, type, meta };
+    LOGS.push(entry);
+    if (LOGS.length > DEFAULTS.maxLogs) LOGS.shift();
+    persistLogs();
+    if (currentTab === "Logs") renderLogs();
+    try { window.postMessage({ ni: true, source: "interceptor", type: "log", payload: entry }, "*"); } catch (e) {}
+  }
+
+  /**************************************************************************
+   * Tab Renderers
+   **************************************************************************/
+  let currentTab = "Logs";
+
+  function setActiveTab(name) {
+    currentTab = name;
+    side.innerHTML = "";
+    main.innerHTML = "";
+    Object.keys(tabButtons).forEach(k => {
+      tabButtons[k].classList.remove("active");
+      if (k === name) tabButtons[k].classList.add("active");
+    });
+    if (name === "Logs") renderLogs();
+    if (name === "Clones") renderClones();
+    if (name === "Editor") renderEditor();
+    if (name === "Snippets") renderSnippets();
+    if (name === "Settings") renderSettings();
+  }
+
+  // Logs tab
+  function renderLogs() {
+    side.innerHTML = `
+      <div class="ni-row">
+        <button id="ni-clear-logs" class="ni-btn">Clear</button>
+        <button id="ni-export-logs" class="ni-btn">Export</button>
+        <label style="margin-left: auto;"><input class="ni-checkbox" id="ni-pause-logs" type="checkbox"/> Pause</label>
+      </div>
+      <div id="ni-logs-list" style="max-height: 72vh; overflow-y: auto;"></div>
+    `;
+
+    document.getElementById("ni-clear-logs").onclick = () => { 
+      LOGS = []; 
+      persistLogs(); 
+      renderLogs(); 
+      pushLog("Logs cleared", "warn"); 
+    };
+
+    document.getElementById("ni-export-logs").onclick = () => {
+      const blob = new Blob([JSON.stringify(LOGS, null, 2)], { type: "application/json" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `ni-logs-${Date.now()}.json`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 3000);
+    };
+
+    const list = document.getElementById("ni-logs-list");
+    list.innerHTML = "";
+    for (let i = LOGS.length - 1; i >= 0; i--) {
+      const e = LOGS[i];
+      const div = document.createElement("div");
+      div.className = "ni-pre";
+      div.style.marginBottom = "6px";
+      div.textContent = `[${e.ts}] ${e.type.toUpperCase()} — ${e.line}`;
+      div.ondblclick = () => openLogDetail(e);
+      list.appendChild(div);
+    }
+  }
+
+  function openLogDetail(e) {
+    const d = document.createElement("div");
+    const pre = document.createElement("pre");
+    pre.className = "ni-pre";
+    pre.textContent = JSON.stringify(e, null, 2);
+    d.appendChild(pre);
+
+    const btnRow = document.createElement("div");
+    btnRow.style.marginTop = "12px";
+    btnRow.style.display = "flex";
+    btnRow.style.gap = "8px";
+
+    const saveBtn = document.createElement("button");
+    saveBtn.className = "ni-btn";
+    saveBtn.textContent = "Save as Clone";
+    saveBtn.onclick = () => {
+      const c = {
+        id: uid(),
+        name: `Clone from ${new Date(e.ts).toLocaleTimeString()}`,
+        timestamp: nowIso(),
+        autoResend: false,
+        matchMode: "regex",
+        data: safeClone(e.meta),
+        ticks: {}
+      };
+      CLONES.unshift(c);
+      persistClones();
+      hideModal();
+      setActiveTab("Clones");
+      pushLog("Saved clone from log: " + c.name);
+    };
+    btnRow.appendChild(saveBtn);
+
+    const closeBtn = document.createElement("button");
+    closeBtn.className = "ni-btn";
+    closeBtn.textContent = "Close";
+    closeBtn.onclick = hideModal;
+    btnRow.appendChild(closeBtn);
+
+    d.appendChild(btnRow);
+    showModal(d);
+  }
+
+  // Clones tab
+  function renderClones() {
+    side.innerHTML = `
+      <div class="ni-row">
+        <button id="ni-new-clone" class="ni-btn">New Clone</button>
+        <button id="ni-import-clones" class="ni-btn">Import</button>
+        <button id="ni-export-clones" class="ni-btn">Export</button>
+      </div>
+      <div id="ni-clone-list" style="max-height: 72vh; overflow-y: auto;"></div>
+    `;
+
+    document.getElementById("ni-new-clone").onclick = () => {
+      const c = {
+        id: uid(),
+        name: `Clone ${CLONES.length + 1}`,
+        timestamp: nowIso(),
+        autoResend: false,
+        matchMode: "regex",
+        data: { kind: "fetch", url: "", method: "GET", headers: {}, body: null },
+        ticks: {}
+      };
+      CLONES.unshift(c);
+      persistClones();
+      renderClones();
+      pushLog("New clone created", "log", { id: c.id });
+    };
+
+    document.getElementById("ni-import-clones").onclick = () => {
+      const f = document.createElement("input");
+      f.type = "file";
+      f.accept = "application/json";
+      f.onchange = async () => {
+        const file = f.files[0];
+        if (!file) return;
+        try {
+          const txt = await file.text();
+          const arr = JSON.parse(txt);
+          if (!Array.isArray(arr)) throw new Error("JSON must be array");
+          CLONES = arr.concat(CLONES);
+          persistClones();
+          renderClones();
+          pushLog("Imported clones", "log", { count: arr.length });
+        } catch (e) {
+          alert("Import failed: " + e.message);
+        }
+      };
+      f.click();
+    };
+
+    document.getElementById("ni-export-clones").onclick = () => {
+      const blob = new Blob([JSON.stringify(CLONES, null, 2)], { type: "application/json" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `ni-clones-${Date.now()}.json`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 3000);
+    };
+
+    const list = document.getElementById("ni-clone-list");
+    list.innerHTML = "";
+    CLONES.forEach((c, i) => {
+      const div = document.createElement("div");
+      div.className = "ni-pre";
+      div.style.cursor = "pointer";
+      div.style.marginBottom = "6px";
+      div.textContent = `📋 ${c.name}\n[${c.matchMode || 'regex'}] ${c.autoResend ? '[auto]' : '[manual'} ${c.data?.url || 'No URL'}`;
+      div.ondblclick = () => openCloneEditor(c, i);
+      list.appendChild(div);
+    });
+  }
+
+  // Editor tab
+  function renderEditor() {
+    side.innerHTML = `
+      <div id="ni-editor-list" style="max-height: 40vh; overflow-y: auto; margin-bottom: 8px;"></div>
+      <div class="ni-row">
+        <button id="ni-save-ed" class="ni-btn">Save</button>
+        <button id="ni-cancel-ed" class="ni-btn">Close</button>
+      </div>
+    `;
+
+    const list = document.getElementById("ni-editor-list");
+    list.innerHTML = "";
+    CLONES.forEach((c, i) => {
+      const el = document.createElement("div");
+      el.className = "ni-pre";
+      el.style.cursor = "pointer";
+      el.style.marginBottom = "4px";
+      el.textContent = c.name;
+      el.onclick = () => openCloneEditor(c, i);
+      list.appendChild(el);
+    });
+
+    document.getElementById("ni-save-ed").onclick = () => { 
+      pushLog("Save clicked");
+      setActiveTab("Clones");
+    };
+    document.getElementById("ni-cancel-ed").onclick = () => setActiveTab("Clones");
+  }
+
+  // Clone Editor Modal
+  function openCloneEditor(clone, idx) {
+    const cont = document.createElement("div");
+
+    const h = document.createElement("h3");
+    h.textContent = "Edit Clone: " + (clone.name || `Clone ${idx + 1}`);
+    cont.appendChild(h);
+
+    // Name
+    const nameLabel = document.createElement("label");
+    nameLabel.className = "ni-label";
+    nameLabel.textContent = "Clone Name:";
+    cont.appendChild(nameLabel);
+    const nameIn = document.createElement("input");
+    nameIn.className = "ni-input";
+    nameIn.style.width = "100%";
+    nameIn.value = clone.name || "";
+    cont.appendChild(nameIn);
+
+    // Match Mode
+    const matchLabel = document.createElement("label");
+    matchLabel.className = "ni-label";
+    matchLabel.textContent = "Match Mode:";
+    cont.appendChild(matchLabel);
+    const matchSelect = document.createElement("select");
+    matchSelect.className = "ni-select";
+    ["regex", "exact", "ignoreQuery"].forEach(m => {
+      const o = document.createElement("option");
+      o.value = m;
+      o.textContent = m;
+      if (clone.matchMode === m) o.selected = true;
+      matchSelect.appendChild(o);
+    });
+    cont.appendChild(matchSelect);
+
+    // Auto Resend
+    const autoResendLabel = document.createElement("label");
+    autoResendLabel.style.marginTop = "8px";
+    const autoResendChk = document.createElement("input");
+    autoResendChk.className = "ni-checkbox";
+    autoResendChk.type = "checkbox";
+    autoResendChk.checked = clone.autoResend || false;
+    autoResendLabel.appendChild(autoResendChk);
+    autoResendLabel.appendChild(document.createTextNode("Auto-Resend on match"));
+    cont.appendChild(autoResendLabel);
+
+    // URL
+    const urlLabel = document.createElement("label");
+    urlLabel.className = "ni-label";
+    urlLabel.textContent = "URL Pattern:";
+    cont.appendChild(urlLabel);
+    const urlIn = document.createElement("input");
+    urlIn.className = "ni-input";
+    urlIn.style.width = "100%";
+    urlIn.value = clone.data?.url || "";
+    cont.appendChild(urlIn);
+
+    // Method
+    const methodLabel = document.createElement("label");
+    methodLabel.className = "ni-label";
+    methodLabel.textContent = "Method:";
+    cont.appendChild(methodLabel);
+    const methodIn = document.createElement("input");
+    methodIn.className = "ni-input";
+    methodIn.value = clone.data?.method || "GET";
+    cont.appendChild(methodIn);
+
+    // Headers
+    const hdrLabel = document.createElement("label");
+    hdrLabel.className = "ni-label";
+    hdrLabel.textContent = "Headers (JSON):";
+    cont.appendChild(hdrLabel);
+    const hdrArea = document.createElement("textarea");
+    hdrArea.className = "ni-textarea";
+    hdrArea.style.width = "100%";
+    hdrArea.style.height = "80px";
+    hdrArea.value = JSON.stringify(clone.data?.headers || {}, null, 2);
+    cont.appendChild(hdrArea);
+
+    // Body
+    const bodyLabel = document.createElement("label");
+    bodyLabel.className = "ni-label";
+    bodyLabel.textContent = "Body (JSON):";
+    cont.appendChild(bodyLabel);
+    const bodyArea = document.createElement("textarea");
+    bodyArea.className = "ni-textarea";
+    bodyArea.style.width = "100%";
+    bodyArea.style.height = "120px";
+    try {
+      bodyArea.value = JSON.stringify(clone.data?.body || null, null, 2);
+    } catch (e) {
+      bodyArea.value = "";
+    }
+    cont.appendChild(bodyArea);
+
+    // File Upload
+    const fileLabel = document.createElement("label");
+    fileLabel.className = "ni-label";
+    fileLabel.textContent = "Replacement File (optional):";
+    cont.appendChild(fileLabel);
+    const fileInput = document.createElement("input");
+    fileInput.type = "file";
+    cont.appendChild(fileInput);
+
+    fileInput.onchange = async () => {
+      const f = fileInput.files[0];
+      if (!f) return;
+      if (f.size / 1024 > (SETTINGS.sizeLimitKB || DEFAULTS.sizeLimitKB)) {
+        if (!confirm("File exceeds size limit. Persist anyway?")) return;
+      }
+      const b64 = await blobToBase64(f);
+      const placeholder = {
+        __placeholder: true,
+        kind: "File",
+        name: f.name,
+        type: f.type,
+        size: f.size,
+        _replacementBase64: b64
+      };
+      bodyArea.value = JSON.stringify(placeholder, null, 2);
+    };
+
+    // Ticks Editor
+    const ticksLabel = document.createElement("label");
+    ticksLabel.className = "ni-label";
+    ticksLabel.textContent = "Ticked Fields (check to apply on resend):";
+    cont.appendChild(ticksLabel);
+
+    const ticksContainer = document.createElement("div");
+    ticksContainer.style.border = "1px dashed #2b6c3a";
+    ticksContainer.style.padding = "8px";
+    ticksContainer.style.marginBottom = "8px";
+    ticksContainer.style.borderRadius = "4px";
+    ticksContainer.style.maxHeight = "200px";
+    ticksContainer.style.overflowY = "auto";
+    cont.appendChild(ticksContainer);
+
+    function createTicksUI() {
+      ticksContainer.innerHTML = "";
+      const ticks = clone.ticks || {};
+      
+      function node(parent, key, val, pathArr) {
+        const row = document.createElement("div");
+        row.style.marginLeft = (pathArr.length * 12) + "px";
+        row.style.marginBottom = "4px";
+
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.className = "ni-checkbox";
+        const pathKey = pathArr.concat(key).join(".");
+        cb.setAttribute("data-path", pathKey);
+        cb.checked = !!ticks[pathKey];
+        row.appendChild(cb);
+
+        const label = document.createElement("span");
+        label.style.fontWeight = "600";
+        label.textContent = (typeof key === "number" ? `[${key}]` : key + ": ");
+        row.appendChild(label);
+
+        if (val && typeof val === "object" && !val.__placeholder) {
+          const summary = document.createElement("span");
+          summary.textContent = Array.isArray(val) ? `Array(${val.length})` : "Object";
+          row.appendChild(summary);
+          parent.appendChild(row);
+
+          const child = document.createElement("div");
+          parent.appendChild(child);
+
+          if (Array.isArray(val)) {
+            val.forEach((el, idx) => node(child, idx, el, pathArr.concat(key)));
+          } else {
+            for (const k in val) node(child, k, val[k], pathArr.concat(key));
+          }
+        } else {
+          const preview = document.createElement("span");
+          preview.style.marginLeft = "8px";
+          preview.textContent = JSON.stringify(val);
+          row.appendChild(preview);
+          parent.appendChild(row);
+        }
+      }
+
+      try {
+        const objVal = safeJSONParse(bodyArea.value) || {};
+        if (clone.data?.headers) node(ticksContainer, "headers", clone.data.headers, []);
+        for (const k in objVal) node(ticksContainer, k, objVal[k], []);
+      } catch (e) {
+        ticksContainer.textContent = "Invalid JSON for ticks generation";
+      }
+    }
+
+    createTicksUI();
+
+    // Button Row
+    const btnRow = document.createElement("div");
+    btnRow.style.marginTop = "12px";
+    btnRow.style.display = "flex";
+    btnRow.style.gap = "8px";
+
+    const saveBtn = document.createElement("button");
+    saveBtn.className = "ni-btn";
+    saveBtn.textContent = "Save Clone";
+    saveBtn.onclick = () => {
+      clone.name = nameIn.value || clone.name;
+      clone.matchMode = matchSelect.value;
+      clone.autoResend = autoResendChk.checked;
+      clone.data = clone.data || {};
+      clone.data.url = urlIn.value;
+      clone.data.method = methodIn.value;
+
+      try {
+        clone.data.headers = JSON.parse(hdrArea.value || "{}");
+      } catch (e) {
+        alert("Headers JSON invalid");
+        return;
+      }
+
+      try {
+        clone.data.body = JSON.parse(bodyArea.value);
+      } catch (e) {
+        clone.data.body = bodyArea.value;
+      }
+
+      // Collect ticks
+      const cbs = ticksContainer.querySelectorAll('input[type="checkbox"][data-path]');
+      const newTicks = {};
+      cbs.forEach(cb => {
+        if (cb.checked) newTicks[cb.getAttribute("data-path")] = true;
+      });
+      clone.ticks = newTicks;
+
+      CLONES.splice(idx, 1, clone);
+      persistClones();
+      hideModal();
+      renderClones();
+      pushLog("Clone saved: " + clone.name);
+    };
+    btnRow.appendChild(saveBtn);
+
+    const cancelBtn = document.createElement("button");
+    cancelBtn.className = "ni-btn";
+    cancelBtn.textContent = "Cancel";
+    cancelBtn.onclick = hideModal;
+    btnRow.appendChild(cancelBtn);
+
+    const delBtn = document.createElement("button");
+    delBtn.className = "ni-btn ni-btn-danger";
+    delBtn.textContent = "Delete";
+    delBtn.onclick = () => {
+      if (!confirm("Delete clone?")) return;
+      CLONES.splice(idx, 1);
+      persistClones();
+      hideModal();
+      renderClones();
+      pushLog("Clone deleted", "warn");
+    };
+    btnRow.appendChild(delBtn);
+
+    cont.appendChild(btnRow);
+    showModal(cont);
+  }
+
+  // Snippets tab
+  function renderSnippets() {
+    side.innerHTML = `
+      <div class="ni-row">
+        <button id="sn-new" class="ni-btn">New Snippet</button>
+        <button id="sn-import" class="ni-btn">Import</button>
+        <button id="sn-export" class="ni-btn">Export</button>
+      </div>
+      <div id="sn-list" style="max-height: 60vh; overflow-y: auto;"></div>
+    `;
+
+    document.getElementById("sn-new").onclick = () => openSnippetEditor();
+
+    document.getElementById("sn-import").onclick = () => {
+      const f = document.createElement("input");
+      f.type = "file";
+      f.accept = "application/json";
+      f.onchange = async () => {
+        const file = f.files[0];
+        if (!file) return;
+        const txt = await file.text();
+        try {
+          const obj = JSON.parse(txt);
+          Object.assign(SNIPPETS, obj);
+          persistSnippets();
+          renderSnippets();
+          pushLog("Snippets imported", "log");
+        } catch (e) {
+          alert("Import failed: " + e.message);
+        }
+      };
+      f.click();
+    };
+
+    document.getElementById("sn-export").onclick = () => {
+      const blob = new Blob([JSON.stringify(SNIPPETS, null, 2)], { type: "application/json" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `ni-snippets-${Date.now()}.json`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 3000);
+    };
+
+    const list = document.getElementById("sn-list");
+    list.innerHTML = "";
+    Object.keys(SNIPPETS).forEach(name => {
+      const s = SNIPPETS[name];
+      const div = document.createElement("div");
+      div.className = "ni-pre";
+      div.style.cursor = "pointer";
+      div.style.marginBottom = "4px";
+      div.textContent = `📄 ${name}\n[${s.type || 'general'}] ${s.autorun ? '[autorun]' : ''}`;
+      div.onclick = () => openSnippetEditor(name, s);
+      list.appendChild(div);
+    });
+  }
+
+  function openSnippetEditor(name, snippet) {
+    const cont = document.createElement("div");
+
+    const title = document.createElement("h3");
+    title.textContent = name ? `Edit: ${name}` : "New Snippet";
+    cont.appendChild(title);
+
+    const nameLabel = document.createElement("label");
+    nameLabel.className = "ni-label";
+    nameLabel.textContent = "Snippet Name:";
+    cont.appendChild(nameLabel);
+    const nameIn = document.createElement("input");
+    nameIn.className = "ni-input";
+    nameIn.style.width = "100%";
+    nameIn.value = name || "";
+    cont.appendChild(nameIn);
+
+    const typeLabel = document.createElement("label");
+    typeLabel.className = "ni-label";
+    typeLabel.textContent = "Type:";
+    cont.appendChild(typeLabel);
+    const typeSel = document.createElement("select");
+    typeSel.className = "ni-select";
+    ["general", "interceptor", "utility"].forEach(t => {
+      const o = document.createElement("option");
+      o.value = t;
+      o.textContent = t;
+      if (snippet && snippet.type === t) o.selected = true;
+      typeSel.appendChild(o);
+    });
+    cont.appendChild(typeSel);
+
+    const codeLabel = document.createElement("label");
+    codeLabel.className = "ni-label";
+    codeLabel.textContent = "Code:";
+    cont.appendChild(codeLabel);
+    const codeArea = document.createElement("textarea");
+    codeArea.className = "ni-textarea";
+    codeArea.style.width = "100%";
+    codeArea.style.height = "260px";
+    codeArea.value = snippet ? snippet.code : "";
+    cont.appendChild(codeArea);
+
+    const autorunLabel = document.createElement("label");
+    autorunLabel.style.marginTop = "8px";
+    const autorunChk = document.createElement("input");
+    autorunChk.className = "ni-checkbox";
+    autorunChk.type = "checkbox";
+    autorunChk.checked = snippet && snippet.autorun ? true : false;
+    autorunLabel.appendChild(autorunChk);
+    autorunLabel.appendChild(document.createTextNode("Run on page load"));
+    cont.appendChild(autorunLabel);
+
+    const btnRow = document.createElement("div");
+    btnRow.style.marginTop = "12px";
+    btnRow.style.display = "flex";
+    btnRow.style.gap = "8px";
+
+    const saveBtn = document.createElement("button");
+    saveBtn.className = "ni-btn";
+    saveBtn.textContent = "Save";
+    saveBtn.onclick = () => {
+      const n = nameIn.value.trim();
+      if (!n) return alert("Name required");
+      SNIPPETS[n] = {
+        code: codeArea.value,
+        type: typeSel.value,
+        autorun: autorunChk.checked
+      };
+      persistSnippets();
+      hideModal();
+      renderSnippets();
+      pushLog("Snippet saved: " + n);
+    };
+    btnRow.appendChild(saveBtn);
+
+    const closeBtn = document.createElement("button");
+    closeBtn.className = "ni-btn";
+    closeBtn.textContent = "Close";
+    closeBtn.onclick = hideModal;
+    btnRow.appendChild(closeBtn);
+
+    if (name) {
+      const runBtn = document.createElement("button");
+      runBtn.className = "ni-btn";
+      runBtn.textContent = "Run";
+      runBtn.onclick = () => runSnippet(name);
+      btnRow.appendChild(runBtn);
+
+      const delBtn = document.createElement("button");
+      delBtn.className = "ni-btn ni-btn-danger";
+      delBtn.textContent = "Delete";
+      delBtn.onclick = () => {
+        if (!confirm("Delete snippet?")) return;
+        delete SNIPPETS[name];
+        persistSnippets();
+        hideModal();
+        renderSnippets();
+        pushLog("Snippet deleted", "warn");
+      };
+      btnRow.appendChild(delBtn);
+    }
+
+    cont.appendChild(btnRow);
+    showModal(cont);
+  }
+
+  function runSnippet(name) {
+    const sn = SNIPPETS[name];
+    if (!sn) return alert("Snippet not found");
+    try {
+      const codeWrap = `(async function(){ try { ${sn.code} } catch(e) { console.error('snippet error', e); } })();`;
+      if (window.eval) window.eval(codeWrap);
+      pushLog("Snippet executed: " + name, "log");
+    } catch (e) {
+      pushLog("Snippet execution failed: " + String(e), "error");
+    }
+  }
+
+  // Settings tab
+  function renderSettings() {
+    side.innerHTML = `<div style="color: #2ecc71; font-weight: 600;">Settings</div>`;
+    main.innerHTML = `
+      <div style="display: flex; flex-direction: column; gap: 12px;">
+        <div>
+          <label class="ni-label">Max base64 persist size (KB):</label>
+          <input id="ni-size-limit" class="ni-input" style="width: 100%;" value="${SETTINGS.sizeLimitKB || DEFAULTS.sizeLimitKB}" />
+        </div>
+        <label>
+          <input class="ni-checkbox" id="ni-auto-inject" type="checkbox" /> Auto-inject clones on page load
+        </label>
+        <button id="ni-clear-storage" class="ni-btn ni-btn-danger">Clear All Storage</button>
+        <div style="margin-top: 16px; padding: 8px; border: 1px solid #2ecc71; border-radius: 4px;">
+          <div style="color: #2ecc71; margin-bottom: 8px;"><strong>Status:</strong></div>
+          <div>🔗 Clones: ${CLONES.length}</div>
+          <div>📊 Logs: ${LOGS.length}</div>
+          <div>📄 Snippets: ${Object.keys(SNIPPETS).length}</div>
+        </div>
+      </div>
+    `;
+
+    document.getElementById("ni-size-limit").onchange = (e) => {
+      SETTINGS.sizeLimitKB = Number(e.target.value || DEFAULTS.sizeLimitKB);
+      persistSettings();
+      pushLog("Settings updated", "log");
+    };
+
+    document.getElementById("ni-auto-inject").onchange = (e) => {
+      SETTINGS.autoInject = e.target.checked;
+      persistSettings();
+      pushLog("Auto-inject: " + (e.target.checked ? "enabled" : "disabled"), "log");
+    };
+
+    document.getElementById("ni-clear-storage").onclick = () => {
+      if (!confirm("Clear all stored data? This cannot be undone.")) return;
+      CLONES = [];
+      LOGS = [];
+      SNIPPETS = {};
+      persistClones();
+      persistLogs();
+      persistSnippets();
+      renderSettings();
+      pushLog("All storage cleared", "warn");
+    };
+  }
+
+  /**************************************************************************
+   * Core Interceptors: Fetch, XHR, WebSocket
+   **************************************************************************/
+  const original = {
+    fetch: window.fetch,
+    XMLHttpRequest: window.XMLHttpRequest,
+    WebSocket: window.WebSocket
+  };
+
+  function matchURL(url, clone) {
+    if (!clone || !clone.data || !clone.data.url) return false;
+    const target = clone.data.url;
+    switch (clone.matchMode) {
+      case "exact":
+        return url === target;
+      case "ignoreQuery":
+        return url.split("?")[0] === target.split("?")[0];
+      case "regex":
+      default:
+        try {
+          return new RegExp(target).test(url);
+        } catch (e) {
+          return false;
+        }
+    }
+  }
+
+  function applyTickedFields(clone, intercepted) {
+    const merged = JSON.parse(JSON.stringify(intercepted));
+    
+    function merge(obj, target, path) {
+      if (typeof obj !== "object" || obj === null) return;
+      for (const k in obj) {
+        const pathKey = path.concat(k).join(".");
+        const ticked = clone.ticks && clone.ticks[pathKey];
+        if (ticked) {
+          if (typeof obj[k] === "object" && obj[k] !== null && target[k] !== undefined) {
+            merge(obj[k], target[k], path.concat(k));
+          } else {
+            target[k] = obj[k];
+          }
+        }
+      }
+    }
+
+    merge(clone.data, merged, []);
+    return merged;
+  }
+
+  // XHR Patch
+  if (original.XMLHttpRequest) {
+    const origOpen = original.XMLHttpRequest.prototype.open;
+    const origSend = original.XMLHttpRequest.prototype.send;
+    const origSet = original.XMLHttpRequest.prototype.setRequestHeader;
+
+    original.XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+      try {
+        this._ni_method = method;
+        this._ni_url = String(url);
+        this._ni_headers = {};
+      } catch (e) {}
+      return origOpen.call(this, method, url, ...rest);
+    };
+
+    original.XMLHttpRequest.prototype.setRequestHeader = function (k, v) {
+      try {
+        this._ni_headers = this._ni_headers || {};
+        this._ni_headers[k] = v;
+      } catch (e) {}
+      return origSet.call(this, k, v);
+    };
+
+    original.XMLHttpRequest.prototype.send = function (body) {
+      try {
+        const intercepted = {
+          kind: "xhr",
+          url: this._ni_url,
+          method: this._ni_method,
+          headers: safeClone(this._ni_headers || {}),
+          body: safeClone(body),
+          timestamp: nowIso()
+        };
+        pushLog(`📡 XHR: ${intercepted.method} ${intercepted.url}`, "log", intercepted);
+
+        for (const sc of CLONES) {
+          if (sc.autoResend && matchURL(intercepted.url, sc)) {
+            const modified = applyTickedFields(sc, intercepted);
+            pushLog(`⚡ Auto-XHR sent for ${intercepted.url}`, "log", modified);
+            const revived = revivePlaceholders(modified);
+            try {
+              const x = new original.XMLHttpRequest();
+              x.open(revived.method || modified.method, revived.url || modified.url);
+              for (const hk in revived.headers) {
+                try {
+                  x.setRequestHeader(hk, revived.headers[hk]);
+                } catch (e) {}
+              }
+              x.send(revived.body === undefined ? null : revived.body);
+            } catch (e) {
+              pushLog("Auto-XHR send failed: " + String(e), "error");
+            }
+            return;
+          }
+        }
+      } catch (e) {
+        console.warn("XHR patch error", e);
+      }
+      return origSend.call(this, body);
+    };
+  }
+
+  // Fetch Patch
+  if (original.fetch) {
+    window.fetch = async function (url, opts) {
+      opts = opts || {};
+      opts.headers = opts.headers || {};
+      const intercepted = {
+        kind: "fetch",
+        url: String(url),
+        opts: safeClone(opts),
+        timestamp: nowIso()
+      };
+      pushLog(`📡 Fetch: ${intercepted.url}`, "log", intercepted);
+
+      for (const sc of CLONES) {
+        if (sc.autoResend && matchURL(intercepted.url, sc)) {
+          const modified = applyTickedFields(sc, intercepted);
+          pushLog(`⚡ Auto-fetch sent for ${intercepted.url}`, "log", modified);
+          try {
+            if (modified.opts && modified.opts.body) {
+              modified.opts.body = revivePlaceholders(modified.opts.body);
+            }
+            return original.fetch(modified.url || url, modified.opts || opts);
+          } catch (e) {
+            pushLog("Auto-fetch send failed: " + String(e), "error");
+            return original.fetch(url, opts);
+          }
+        }
+      }
+      return original.fetch(url, opts);
+    };
+  }
+
+  // WebSocket & STOMP Patch
+  function isLikelyStompFrame(txt) {
+    if (!txt || typeof txt !== "string") return false;
+    const h = txt.trim().slice(0, 12).toUpperCase();
+    return /^(CONNECT|SEND|MESSAGE|SUBSCRIBE|UNSUBSCRIBE|ACK|NACK|DISCONNECT|BEGIN|COMMIT|ABORT)/.test(h);
+  }
+
+  function parseStompFrame(raw) {
+    try {
+      const firstNl = raw.indexOf("\n");
+      const command = raw.slice(0, firstNl).trim();
+      const rest = raw.slice(firstNl + 1);
+      const parts = rest.split("\n\n");
+      const headerPart = parts[0] || "";
+      const bodyPart = parts.slice(1).join("\n\n").replace(/\0$/, "");
+      const hdrLines = headerPart.split("\n").filter(Boolean);
+      const headers = {};
+      hdrLines.forEach(line => {
+        const i = line.indexOf(":");
+        if (i >= 0) {
+          headers[line.slice(0, i)] = line.slice(i + 1);
+        }
+      });
+      let parsedBody = bodyPart;
+      try {
+        parsedBody = JSON.parse(bodyPart);
+      } catch (e) {}
+      return { command, headers, body: parsedBody, raw: raw };
+    } catch (e) {
+      return { command: "UNKNOWN", headers: {}, body: raw, raw };
+    }
+  }
+
+  if (original.WebSocket) {
+    const OrigWS = original.WebSocket;
+
+    function WrappedWS(url, protocols) {
+      const ws = protocols ? new OrigWS(url, protocols) : new OrigWS(url);
+      const origSend = ws.send.bind(ws);
+
+      ws.send = function (data) {
+        try {
+          const preview = (typeof data === "string") ? data.slice(0, 200) : `[binary ${data && data.byteLength ? data.byteLength : 'N/A'}]`;
+          pushLog(`⚡ WS send: ${preview}`, "log", { url, data: preview });
+
+          if (typeof data === "string" && isLikelyStompFrame(data)) {
+            const parsed = parseStompFrame(data);
+            pushLog("STOMP send: " + parsed.command, "log", Object.assign({ direction: "send", url }, parsed));
+          }
+        } catch (e) {}
+        return origSend(data);
+      };
+
+      ws.addEventListener("message", function (ev) {
+        try {
+          const d = ev.data;
+          const preview = (typeof d === "string") ? d.slice(0, 200) : `[binary ${d && d.byteLength ? d.byteLength : 'N/A'}]`;
+          pushLog(`⚡ WS recv: ${preview}`, "log", { url, data: preview });
+
+          if (typeof d === "string" && isLikelyStompFrame(d)) {
+            const parsed = parseStompFrame(d);
+            pushLog("STOMP recv: " + parsed.command, "log", Object.assign({ direction: "recv", url }, parsed));
+          }
+        } catch (e) {}
+      });
+
+      return ws;
+    }
+
+    WrappedWS.prototype = OrigWS.prototype;
+    window.WebSocket = WrappedWS;
+  }
+
+  /**************************************************************************
+   * Public API
+   **************************************************************************/
+  window.NI = window.NI || {};
+  window.NI.Clones = {
+    list: () => CLONES,
+    add: (c) => { CLONES.unshift(c); persistClones(); },
+    remove: (id) => { CLONES = CLONES.filter(c => c.id !== id); persistClones(); }
+  };
+  window.NI.Logs = {
+    list: () => LOGS,
+    clear: () => { LOGS = []; persistLogs(); }
+  };
+  window.NI.Snippets = {
+    list: () => SNIPPETS,
+    run: (name) => runSnippet(name)
+  };
+  window.NI.getStatus = () => ({
+    clones: CLONES.length,
+    logs: LOGS.length,
+    snippets: Object.keys(SNIPPETS).length,
+    settings: SETTINGS
+  });
+
+  /**************************************************************************
+   * Initialization
+   **************************************************************************/
+  setActiveTab("Logs");
+  pushLog("⚡ Universal Network Interceptor v2.0 ready - Fetch/XHR/WS/STOMP");
+
+  // Run autorun snippets
+  window.addEventListener("load", () => {
+    Object.entries(SNIPPETS).forEach(([name, sn]) => {
+      if (sn.autorun) runSnippet(name);
+    });
+  });
+
+})();
