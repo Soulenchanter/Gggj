@@ -1,409 +1,224 @@
+(function () {
+    'use strict';
 
-/**
- * Mini DevTools+ (Mobile First Edition)
- * Full combined rewritten version
- * Touch-friendly • Performant • Safe • Modular
- */
+    /* ============================================================
+       CONFIG
+    ============================================================ */
+    const CONFIG = {
+        version: '2.4.0',
+        storageScripts: 'se_scripts_anonymous',
+        storageSnippets: 'se_snippets_anonymous',
+        iframePollInterval: 3000,
 
-(() => {
-  "use strict";
-
-  /* ============================================================
-   * Persistent Storage
-   * ============================================================ */
-  const STORAGE_KEY_SNIPPETS = "mcc_snippets_v2";
-  const STORAGE_KEY_SIZE = "mcc_panel_size_v2";
-  const STORAGE_KEY_POS = "mcc_button_pos_v2";
-  const STORAGE_KEY_MIN = "mcc_min_v2";
-
-  let snippets =
-    JSON.parse(localStorage.getItem(STORAGE_KEY_SNIPPETS) || "{}");
-
-  function saveSnippets() {
-    localStorage.setItem(STORAGE_KEY_SNIPPETS, JSON.stringify(snippets));
-  }
-
-  /* ============================================================
-   * State
-   * ============================================================ */
-  let activeTab = "WS";
-  const logs = { ws: [], xhr: [], pm: [] };
-
-  /* ============================================================
-   * DOM: Floating Button
-   * ============================================================ */
-  const floatBtn = document.createElement("div");
-  Object.assign(floatBtn.style, {
-    position: "fixed",
-    top: "40px",
-    left: "10px",
-    width: "56px",
-    height: "56px",
-    background: "#1e1e1e",
-    color: "#fff",
-    borderRadius: "50%",
-    display: "flex",
-    justifyContent: "center",
-    alignItems: "center",
-    fontSize: "28px",
-    zIndex: 999999,
-    boxShadow: "0 0 10px #000",
-    touchAction: "none",
-    userSelect: "none",
-    cursor: "pointer",
-  });
-  floatBtn.textContent = "≡";
-  document.body.appendChild(floatBtn);
-
-  restoreButtonPosition();
-
-  /* Drag floating button */
-  (() => {
-    let startX, startY, sLeft, sTop, dragging = false;
-    floatBtn.addEventListener("pointerdown", (e) => {
-      dragging = true;
-      startX = e.clientX;
-      startY = e.clientY;
-      sLeft = floatBtn.offsetLeft;
-      sTop = floatBtn.offsetTop;
-      floatBtn.setPointerCapture(e.pointerId);
-    });
-
-    floatBtn.addEventListener("pointermove", (e) => {
-      if (!dragging) return;
-      floatBtn.style.left = sLeft + (e.clientX - startX) + "px";
-      floatBtn.style.top = sTop + (e.clientY - startY) + "px";
-    });
-
-    floatBtn.addEventListener("pointerup", (e) => {
-      dragging = false;
-      floatBtn.releasePointerCapture(e.pointerId);
-      saveButtonPosition();
-    });
-  })();
-
-  function saveButtonPosition() {
-    localStorage.setItem(
-      STORAGE_KEY_POS,
-      JSON.stringify({
-        left: floatBtn.style.left,
-        top: floatBtn.style.top,
-      })
-    );
-  }
-
-  function restoreButtonPosition() {
-    const saved = JSON.parse(localStorage.getItem(STORAGE_KEY_POS) || "null");
-    if (saved) {
-      floatBtn.style.left = saved.left;
-      floatBtn.style.top = saved.top;
-    }
-  }
-
-  /* ============================================================
-   * DOM: Slide-In Panel
-   * ============================================================ */
-  const panel = document.createElement("div");
-  Object.assign(panel.style, {
-    position: "fixed",
-    top: "0px",
-    right: "-85%",
-    width: "85%",
-    height: "100%",
-    background: "#111",
-    color: "#fff",
-    zIndex: 999998,
-    boxShadow: "0 0 15px #000",
-    display: "flex",
-    flexDirection: "column",
-    transition: "right 0.25s ease",
-    fontFamily: "monospace",
-    overflow: "hidden",
-  });
-  document.body.appendChild(panel);
-
-  let panelOpen = false;
-
-  function openPanel() {
-    panel.style.right = "0";
-    panelOpen = true;
-  }
-  function closePanel() {
-    panel.style.right = "-85%";
-    panelOpen = false;
-  }
-
-  floatBtn.onclick = () => {
-    panelOpen ? closePanel() : openPanel();
-  };
-
-  /* ============================================================
-   * Panel Layout
-   * ============================================================ */
-  panel.innerHTML = `
-    <div id="mcc-header" style="
-      background:#222;padding:12px;font-size:20px;
-      display:flex;justify-content:space-between;
-      align-items:center;touch-action:none;">
-      <span>Mini DevTools+</span>
-      <button id="mcc-close" style="
-        font-size:20px;background:#444;color:#fff;
-        border:none;padding:6px 14px;border-radius:6px;">X</button>
-    </div>
-
-    <div id="mcc-tabs" style="
-      display:flex;gap:4px;padding:6px;background:#000;">
-      <button data-tab="WS">WS</button>
-      <button data-tab="XHR">XHR</button>
-      <button data-tab="PM">PostMessage</button>
-      <button data-tab="SN">Snippets</button>
-    </div>
-
-    <div id="mcc-content" style="
-      flex:1;overflow:auto;font-size:12px;padding:6px;">
-    </div>
-  `;
-
-  panel.querySelector("#mcc-close").onclick = closePanel;
-
-  const content = panel.querySelector("#mcc-content");
-
-  [...panel.querySelectorAll("#mcc-tabs button")].forEach((btn) => {
-    btn.onclick = () => {
-      activeTab = btn.dataset.tab;
-      drawActiveTab();
+        // Optional auto-sync (public RAW GitHub URL)
+        autoSyncGitHub: true,
+        githubSnippetsRawUrl: '', // <-- paste RAW github snippets.js here
     };
-  });
 
-  /* ============================================================
-   * Renderers
-   * ============================================================ */
+    /* ============================================================
+       STATE
+    ============================================================ */
+    const state = {
+        selectedContext: null,
+        executionMode: 'top',
+        frames: {},
+        scripts: {},
+        snippets: {}
+    };
 
-  function drawActiveTab() {
-    if (activeTab === "SN") return drawSnippets();
+    /* ============================================================
+       UTILS
+    ============================================================ */
+    const Utils = {
+        time: () => new Date().toLocaleTimeString(),
+        load: k => {
+            try { return JSON.parse(localStorage.getItem(k)) || {}; }
+            catch { return {}; }
+        },
+        save: (k, v) => {
+            try { localStorage.setItem(k, JSON.stringify(v)); }
+            catch {}
+        },
+        async loadFromGitHub(rawUrl) {
+            const r = await fetch(rawUrl, { cache: 'no-store' });
+            const t = await r.text();
+            const mod = {};
+            new Function('module', t + ';return module.exports||exports?.default')(mod);
+            return mod.exports || mod.default || {};
+        },
+        frameLabel(frame, index) {
+            try {
+                const w = frame.contentWindow;
+                return w.document.title || new URL(w.location.href).hostname;
+            } catch {
+                return frame.name || frame.id || `Frame_${index + 1}`;
+            }
+        }
+    };
 
-    const type = activeTab === "WS" ? "ws"
-               : activeTab === "XHR" ? "xhr"
-               : "pm";
-
-    const arr = logs[type];
-
-    content.innerHTML = `
-      <div style="color:#aaa;margin-bottom:4px;">
-        Showing last ${arr.length} ${activeTab} entries
-      </div>
+    /* ============================================================
+       STYLES
+    ============================================================ */
+    const style = document.createElement('style');
+    style.textContent = `
+    .se-overlay{position:fixed;bottom:20px;right:20px;width:460px;height:560px;
+    background:#fff;border-radius:14px;box-shadow:0 25px 50px rgba(0,0,0,.35);
+    z-index:999999;font-family:-apple-system,BlinkMacSystemFont,Segoe UI;display:flex;flex-direction:column}
+    .se-header{background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;
+    padding:12px 14px;font-weight:700;border-radius:14px 14px 0 0;cursor:move}
+    .se-tabs{display:flex;border-bottom:2px solid #e5e7eb}
+    .se-tab{flex:1;padding:10px;border:none;background:none;font-weight:600;cursor:pointer}
+    .se-tab.active{color:#667eea;border-bottom:3px solid #667eea}
+    .se-content{flex:1;overflow:auto;padding:12px}
+    textarea,input,select{width:100%;margin-top:6px;padding:10px;border-radius:8px;border:2px solid #e5e7eb}
+    textarea{font-family:monospace;min-height:120px}
+    button{padding:8px 12px;border-radius:8px;border:none;font-weight:600;cursor:pointer}
+    .primary{background:#667eea;color:#fff}
+    .secondary{background:#f3f4f6}
+    .log{font-family:monospace;font-size:11px}
     `;
+    document.head.appendChild(style);
 
-    arr.forEach((entry) => {
-      const pre = document.createElement("pre");
-      Object.assign(pre.style, {
-        background: "#000",
-        padding: "6px",
-        marginBottom: "4px",
-        borderRadius: "6px",
-        whiteSpace: "pre-wrap",
-      });
-      pre.textContent = safeDecode(entry.data);
-      content.appendChild(pre);
-    });
-  }
+    /* ============================================================
+       UI
+    ============================================================ */
+    const ui = document.createElement('div');
+    ui.className = 'se-overlay';
+    ui.innerHTML = `
+        <div class="se-header">⚙️ Script Executor Pro</div>
 
-  /* ============================================================
-   * Decode helper
-   * ============================================================ */
-  function safeDecode(d) {
-    try {
-      if (typeof d === "string") {
-        try { return JSON.stringify(JSON.parse(d), null, 2); }
-        catch {}
-        return d;
-      }
-      if (d instanceof ArrayBuffer) {
-        const u8 = new Uint8Array(d).slice(0, 16);
-        return `[ArrayBuffer ${d.byteLength} bytes] ${[...u8].map(v=>v.toString(16)).join(" ")}...`;
-      }
-      return JSON.stringify(d, null, 2);
-    } catch {
-      return "[decode error]";
-    }
-  }
+        <div class="se-tabs">
+            <button class="se-tab active" data-tab="exec">Execute</button>
+            <button class="se-tab" data-tab="snippets">Snippets</button>
+            <button class="se-tab" data-tab="log">Log</button>
+        </div>
 
-  /* ============================================================
-   * Snippet UI
-   * ============================================================ */
-  function drawSnippets() {
-    content.innerHTML = `
-      <div style="display:flex;flex-direction:column;gap:6px;">
-        <textarea id="sn-code" rows="7"
-          style="width:100%;background:#000;color:#fff;"></textarea>
+        <div class="se-content" id="exec-tab">
+            <select id="ctx"></select>
+            <select id="mode">
+                <option value="safe">Safe (eval)</option>
+                <option value="frame">Frame (direct)</option>
+                <option value="top">Top (direct)</option>
+                <option value="inject">Injected (script tag)</option>
+            </select>
+            <textarea id="code">// JavaScript here</textarea>
+            <button class="primary" id="run">Execute</button>
+        </div>
 
-        <input id="sn-name" placeholder="Snippet name"
-          style="padding:8px;background:#000;color:#fff;border:1px solid #333;">
+        <div class="se-content" id="snippets-tab" style="display:none">
+            <div id="snipList"></div>
+        </div>
 
-        <select id="sn-target"
-          style="padding:8px;background:#000;color:#fff;border:1px solid #333;">
-        </select>
-
-        <select id="sn-auto"
-          style="padding:8px;background:#000;color:#fff;border:1px solid #333;">
-          <option value="manual">manual</option>
-          <option value="load">load</option>
-          <option value="hook">hook</option>
-          <option value="always">always</option>
-        </select>
-
-        <button id="sn-save"
-          style="padding:10px;background:#222;color:#fff;">Save</button>
-        <button id="sn-run"
-          style="padding:10px;background:#444;color:#fff;">Run</button>
-      </div>
+        <div class="se-content log" id="log-tab" style="display:none"></div>
     `;
+    document.body.appendChild(ui);
 
-    const snCode = content.querySelector("#sn-code");
-    const snName = content.querySelector("#sn-name");
-    const snAuto = content.querySelector("#sn-auto");
-    const snTarget = content.querySelector("#sn-target");
-
-    /* Populate iframe list */
-    const frames = getFrames();
-    frames.forEach((frm, i) => {
-      const opt = document.createElement("option");
-      opt.value = i;
-      opt.textContent = frm.label;
-      snTarget.appendChild(opt);
+    /* ============================================================
+       TABS
+    ============================================================ */
+    document.querySelectorAll('.se-tab').forEach(b => {
+        b.onclick = () => {
+            document.querySelectorAll('.se-tab').forEach(x => x.classList.remove('active'));
+            document.querySelectorAll('.se-content').forEach(x => x.style.display = 'none');
+            b.classList.add('active');
+            document.getElementById(b.dataset.tab + '-tab').style.display = 'block';
+        };
     });
 
-    content.querySelector("#sn-save").onclick = () => {
-      const name = snName.value.trim();
-      if (!name) return alert("No name");
-      snippets[name] = {
-        code: snCode.value,
-        autorun: snAuto.value,
-        target: parseInt(snTarget.value),
-      };
-      saveSnippets();
-      alert("Saved");
+    /* ============================================================
+       LOGGER
+    ============================================================ */
+    const log = msg => {
+        const l = document.getElementById('log-tab');
+        l.innerHTML += `[${Utils.time()}] ${msg}<br>`;
+        l.scrollTop = l.scrollHeight;
     };
 
-    content.querySelector("#sn-run").onclick = () => {
-      const name = snName.value.trim();
-      if (!snippets[name]) return alert("No snippet");
-      execSnippet(snippets[name]);
+    /* ============================================================
+       EXECUTION (MAX PERMISSIONS)
+    ============================================================ */
+    run.onclick = () => {
+        const codeVal = code.value;
+        const ctxVal = ctx.value;
+        const modeVal = mode.value;
+        if (!codeVal) return;
+
+        try {
+            if (modeVal === 'inject') {
+                const s = document.createElement('script');
+                s.textContent = codeVal;
+                document.documentElement.appendChild(s);
+                s.remove();
+                log('Injected into DOM (max permission)');
+                return;
+            }
+
+            if (modeVal === 'top' || ctxVal === 'top') {
+                window.eval(codeVal);
+                log('Executed in top window');
+                return;
+            }
+
+            if (modeVal === 'frame' && state.frames[ctxVal]) {
+                state.frames[ctxVal].contentWindow.eval(codeVal);
+                log(`Executed in frame: ${ctxVal}`);
+                return;
+            }
+
+            eval(codeVal);
+            log('Executed in safe mode');
+        } catch (e) {
+            log(e.message);
+        }
     };
-  }
 
-  function execSnippet(sn) {
-    const frames = getFrames();
-    const targetWin = frames[sn.target]?.win || window;
-    try { targetWin.eval(sn.code); }
-    catch (e) { console.warn(e); }
-  }
-
-  /* ============================================================
-   * Iframe scanning
-   * ============================================================ */
-  function getFrames() {
-    const arr = [{ win: window, label: "Top Window" }];
-    [...document.querySelectorAll("iframe")].forEach((f, i) => {
-      try {
-        arr.push({
-          win: f.contentWindow,
-          label: f.name || f.src || ("iframe " + i),
+    /* ============================================================
+       SNIPPETS (AUTO GITHUB SYNC)
+    ============================================================ */
+    function renderSnippets() {
+        snipList.innerHTML = '';
+        Object.entries(state.snippets).forEach(([n, c]) => {
+            const d = document.createElement('div');
+            d.innerHTML = `<strong>${n}</strong><button class="secondary">Run</button>`;
+            d.querySelector('button').onclick = () => eval(c);
+            snipList.appendChild(d);
         });
-      } catch {}
-    });
-    return arr;
-  }
+    }
 
-  /* ============================================================
-   * Autorun handling
-   * ============================================================ */
-  window.addEventListener("load", () => {
-    Object.values(snippets).forEach((sn) => {
-      if (sn.autorun === "load" || sn.autorun === "always") {
-        execSnippet(sn);
-      }
-    });
-  });
+    async function autoSync() {
+        if (!CONFIG.autoSyncGitHub || !CONFIG.githubSnippetsRawUrl) return;
+        try {
+            const data = await Utils.loadFromGitHub(CONFIG.githubSnippetsRawUrl);
+            Object.assign(state.snippets, data);
+            Utils.save(CONFIG.storageSnippets, state.snippets);
+            renderSnippets();
+            log('GitHub snippets synced');
+        } catch {
+            log('GitHub sync failed');
+        }
+    }
 
-  /* ============================================================
-   * Hooks: WebSocket / XHR / Fetch / postMessage
-   * ============================================================ */
+    /* ============================================================
+       FRAMES
+    ============================================================ */
+    function discoverFrames() {
+        ctx.innerHTML = '<option value="top">Top Window</option>';
+        state.frames = {};
+        document.querySelectorAll('iframe').forEach((f, i) => {
+            const label = Utils.frameLabel(f, i);
+            state.frames[label] = f;
+            ctx.add(new Option(label, label));
+        });
+    }
 
-  /* WebSocket */
-  const WS = window.WebSocket;
-  window.WebSocket = function (...args) {
-    const ws = new WS(...args);
-    ws.addEventListener("message", (ev) => {
-      logs.ws.push({ data: ev.data });
-      autoOpenOnHook("ws");
-      if (activeTab === "WS") drawActiveTab();
-    });
-    return ws;
-  };
-
-  /* XHR */
-  const XHR = window.XMLHttpRequest;
-  window.XMLHttpRequest = function () {
-    const x = new XHR();
-    const origOpen = x.open;
-    x.open = function (m, u, ...rest) {
-      x._url = u;
-      return origOpen.call(x, m, u, ...rest);
-    };
-    x.addEventListener("load", () => {
-      logs.xhr.push({ data: { url: x._url, response: x.response } });
-      autoOpenOnHook("xhr");
-      if (activeTab === "XHR") drawActiveTab();
-    });
-    return x;
-  };
-
-  /* Fetch */
-  const fetchOrig = window.fetch;
-  window.fetch = function (...args) {
-    return fetchOrig(...args).then((res) => {
-      res.clone().text().then((txt) => {
-        logs.xhr.push({ data: { url: args[0], response: txt } });
-        autoOpenOnHook("xhr");
-        if (activeTab === "XHR") drawActiveTab();
-      });
-      return res;
-    });
-  };
-
-  /* postMessage */
-  const origPM = window.postMessage;
-  window.postMessage = new Proxy(origPM, {
-    apply(target, thisArg, args) {
-      let msg;
-      try { msg = structuredClone(args[0]); }
-      catch { msg = args[0]; }
-
-      logs.pm.push({ data: msg });
-      autoOpenOnHook("pm");
-      if (activeTab === "PM") drawActiveTab();
-
-      Object.values(snippets).forEach(sn => {
-        if (sn.autorun === "hook") execSnippet(sn);
-        if (sn.autorun === "always") execSnippet(sn);
-      });
-
-      return target.apply(thisArg, args);
-    },
-  });
-
-  window.addEventListener("message", (e) => {
-    logs.pm.push({ data: e.data });
-    autoOpenOnHook("pm");
-    if (activeTab === "PM") drawActiveTab();
-  });
-
-  /* ============================================================
-   * Auto-popup on network activity
-   * ============================================================ */
-  function autoOpenOnHook(type) {
-    openPanel();
-  }
+    /* ============================================================
+       INIT
+    ============================================================ */
+    state.snippets = Utils.load(CONFIG.storageSnippets);
+    renderSnippets();
+    discoverFrames();
+    autoSync();
+    setInterval(discoverFrames, CONFIG.iframePollInterval);
+    log(`Initialized v${CONFIG.version} (anonymous, max-permission)`);
 
 })();
