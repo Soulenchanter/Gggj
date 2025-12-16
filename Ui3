@@ -8,11 +8,11 @@
         version: '2.4.0',
         storageScripts: 'se_scripts_anonymous',
         storageSnippets: 'se_snippets_anonymous',
-        iframePollInterval: 3000,
+        iframePollInterval: 30000,
 
         // Optional auto-sync (public RAW GitHub URL)
         autoSyncGitHub: true,
-        githubSnippetsRawUrl: 'https://github.com/Soulenchanter/Gggj/blob/main/Ui6', // <-- paste RAW github snippets.js here
+        githubSnippetsRawUrl: 'https://github.com/Soulenchanter/Gggj/blob/main/int','https://github.com/Soulenchanter/Gggj/blob/main/claim' // <-- paste RAW github snippets.js here
     };
 
     /* ============================================================
