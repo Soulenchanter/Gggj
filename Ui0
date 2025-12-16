@@ -1,287 +1,459 @@
-(function () {
-'use strict';
+// /Ui.js
+// Mini DevTools+ Overlay v4.3 — Freeze-safe, multi-frame snippet execution
 
-/* ============================================================
-   SCRIPT EXECUTOR PRO — FINAL
-   ============================================================ */
+(() => {
+  "use strict";
 
-/* ================= CONFIG ================= */
-const CONFIG = {
-    storageKey: 'se_snippets_final',
-    githubTokenKey: 'se_github_token',
-    githubApi: 'https://api.github.com',
-    repoDir: 'script-executor',
-    autoSyncOnLoad: true,
-    autoSyncDelay: 1500,
-    idleDelay: 20000
-};
+  const STORAGE_SNIPPETS = "mcc_snippets_v4";
+  const STORAGE_BTN = "mcc_button_pos_v4";
 
-/* ================= STATE ================= */
-const state = {
-    snippets: {},
-    frames: {},
-    idleTimer: null,
-    github: {
-        user: null,
-        repos: [],
-        repo: null,
-        branch: 'main',
-        autoSync: true
+  let snippets = JSON.parse(localStorage.getItem(STORAGE_SNIPPETS) || "{}");
+  const saveSnippets = () =>
+    localStorage.setItem(STORAGE_SNIPPETS, JSON.stringify(snippets));
+
+  /* ================= Toast ================= */
+  function toast(msg, timeout = 3000) {
+    let t = document.getElementById("mcc_toast");
+    if (!t) {
+      t = document.createElement("div");
+      t.id = "mcc_toast";
+      Object.assign(t.style, {
+        position: "fixed",
+        left: "50%",
+        bottom: "80px",
+        transform: "translateX(-50%)",
+        background: "#222",
+        color: "#fff",
+        padding: "10px 14px",
+        borderRadius: "8px",
+        zIndex: 9999999,
+        fontFamily: "system-ui,monospace",
+        fontSize: "13px",
+        opacity: 0,
+        transition: "opacity 0.3s",
+      });
+      document.body.appendChild(t);
     }
-};
+    t.textContent = msg;
+    t.style.opacity = "1";
+    clearTimeout(t._to);
+    t._to = setTimeout(() => (t.style.opacity = "0"), timeout);
+  }
 
-/* ================= UTILS ================= */
-const U = {
-    save() {
-        localStorage.setItem(CONFIG.storageKey, JSON.stringify(state.snippets));
-    },
-    load() {
-        return JSON.parse(localStorage.getItem(CONFIG.storageKey) || '{}');
-    },
-    token: {
-        get: () => localStorage.getItem(CONFIG.githubTokenKey),
-        set: t => t
-            ? localStorage.setItem(CONFIG.githubTokenKey, t)
-            : localStorage.removeItem(CONFIG.githubTokenKey)
-    },
-    log(msg, type = 'info') {
-        const el = document.createElement('div');
-        el.className = `log ${type}`;
-        el.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
-        document.getElementById('log').appendChild(el);
-    },
-    b64enc(s) {
-        return btoa(unescape(encodeURIComponent(s)));
-    },
-    b64dec(s) {
-        return decodeURIComponent(escape(atob(s)));
+  /* ================= Floating Button ================= */
+  const floatBtn = document.createElement("button");
+  floatBtn.textContent = "≡";
+  Object.assign(floatBtn.style, {
+    position: "fixed",
+    top: "40px",
+    left: "10px",
+    width: "56px",
+    height: "56px",
+    borderRadius: "50%",
+    background: "#1e1e1e",
+    color: "#fff",
+    fontSize: "26px",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    boxShadow: "0 6px 18px rgba(0,0,0,0.6)",
+    border: "none",
+    cursor: "pointer",
+    zIndex: 9999998,
+    touchAction: "none",
+  });
+  document.body.appendChild(floatBtn);
+
+  try {
+    const pos = JSON.parse(localStorage.getItem(STORAGE_BTN));
+    if (pos) {
+      floatBtn.style.left = pos.left;
+      floatBtn.style.top = pos.top;
     }
-};
+  } catch {}
 
-/* ================= EXECUTION ================= */
-function execute(code, ctx) {
+  (() => {
+    let dragging = false,
+      sx = 0,
+      sy = 0,
+      sl = 0,
+      st = 0;
+    floatBtn.addEventListener("pointerdown", (e) => {
+      dragging = true;
+      sx = e.clientX;
+      sy = e.clientY;
+      sl = floatBtn.offsetLeft;
+      st = floatBtn.offsetTop;
+      floatBtn.setPointerCapture(e.pointerId);
+    });
+    floatBtn.addEventListener("pointermove", (e) => {
+      if (!dragging) return;
+      floatBtn.style.left = Math.max(4, sl + (e.clientX - sx)) + "px";
+      floatBtn.style.top = Math.max(4, st + (e.clientY - sy)) + "px";
+    });
+    floatBtn.addEventListener("pointerup", (e) => {
+      dragging = false;
+      floatBtn.releasePointerCapture(e.pointerId);
+      localStorage.setItem(
+        STORAGE_BTN,
+        JSON.stringify({ left: floatBtn.style.left, top: floatBtn.style.top })
+      );
+    });
+  })();
+
+  /* ================= Panel ================= */
+  const panel = document.createElement("div");
+  Object.assign(panel.style, {
+    position: "fixed",
+    right: "-100%",
+    top: "0",
+    width: "90%",
+    height: "100%",
+    background: "#111",
+    color: "#fff",
+    zIndex: 9999997,
+    boxShadow: "0 0 30px rgba(0,0,0,0.7)",
+    transition: "right 0.25s",
+    display: "flex",
+    flexDirection: "column",
+    fontFamily: "monospace",
+  });
+  document.body.appendChild(panel);
+
+  let panelOpen = false;
+  floatBtn.onclick = () => {
+    panelOpen = !panelOpen;
+    panel.style.right = panelOpen ? "0" : "-100%";
+  };
+
+  const header = document.createElement("div");
+  Object.assign(header.style, {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    padding: "12px",
+    background: "#151515",
+    borderBottom: "1px solid #222",
+  });
+  const htitle = document.createElement("div");
+  htitle.textContent = "Mini DevTools+";
+  const hclose = document.createElement("button");
+  hclose.textContent = "✕";
+  Object.assign(hclose.style, {
+    background: "#222",
+    color: "#fff",
+    border: "none",
+    padding: "6px 12px",
+    borderRadius: "6px",
+    cursor: "pointer",
+  });
+  hclose.onclick = () => {
+    panelOpen = false;
+    panel.style.right = "-100%";
+  };
+  header.appendChild(htitle);
+  header.appendChild(hclose);
+  panel.appendChild(header);
+
+  /* ================= Tabs ================= */
+  const tabsDiv = document.createElement("div");
+  Object.assign(tabsDiv.style, {
+    display: "flex",
+    gap: "4px",
+    padding: "6px",
+    background: "#000",
+  });
+  const tabNames = ["Snippets", "Frames", "GitHub"];
+  let activeTab = "Snippets";
+  const tabButtons = {};
+  tabNames.forEach((name) => {
+    const b = document.createElement("button");
+    b.textContent = name;
+    Object.assign(b.style, {
+      flex: "1",
+      padding: "6px",
+      background: "#222",
+      color: "#fff",
+      border: "none",
+      borderRadius: "4px",
+    });
+    b.onclick = () => {
+      activeTab = name;
+      drawActiveTab();
+    };
+    tabsDiv.appendChild(b);
+    tabButtons[name] = b;
+  });
+  panel.appendChild(tabsDiv);
+
+  const contentDiv = document.createElement("div");
+  Object.assign(contentDiv.style, {
+    flex: "1",
+    overflow: "auto",
+    padding: "8px",
+  });
+  panel.appendChild(contentDiv);
+
+  /* ================= Frame Collector ================= */
+  function collectFrames(win = window, parentId = "top", depth = 0, out = []) {
+    if (!win || !win.document) return out;
+    out.push({ id: parentId, win, depth });
+
+    const iframes = win.document.querySelectorAll("iframe");
+    iframes.forEach((f, i) => {
+      const fid = parentId + "_f" + i;
+      try {
+        const w = f.contentWindow;
+        void w.location.href;
+        collectFrames(w, fid, depth + 1, out);
+      } catch {
+        out.push({ id: fid, win: null, depth: depth + 1 });
+      }
+    });
+    return out;
+  }
+
+  function drawFrameTree() {
+    contentDiv.innerHTML = "";
+    const tree = collectFrames();
+    tree.forEach((f) => {
+      const div = document.createElement("div");
+      div.style.marginLeft = f.depth * 14 + "px";
+      div.textContent =
+        f.id + (f.win ? "" : " [cross-origin/no-access]");
+      contentDiv.appendChild(div);
+    });
+  }
+
+  /* ================= Eval Bridge ================= */
+  function injectEvalBridge(win) {
     try {
-        if (!ctx || ctx === 'top') eval(code);
-        else state.frames[ctx]?.contentWindow.eval(code);
-        U.log('Executed', 'ok');
-    } catch (e) {
-        U.log(e.message, 'err');
+      if (!win || win.__MCC_BRIDGE__) return;
+      win.__MCC_BRIDGE__ = true;
+      win.addEventListener("message", (e) => {
+        if (!e.data || !e.data.__MCC_EVAL__) return;
+        try {
+          win.eval(e.data.code);
+        } catch (err) {
+          console.error("[MCC eval error]", err);
+        }
+      });
+    } catch {}
+  }
+  injectEvalBridge(window);
+
+  function execInWindow(win, code) {
+    if (!win) return false;
+    try {
+      win.eval(code);
+      return true;
+    } catch {
+      try {
+        win.postMessage({ __MCC_EVAL__: true, code }, "*");
+        return true;
+      } catch {
+        return false;
+      }
     }
-}
+  }
 
-/* ================= GITHUB ================= */
-const GitHub = {
-    headers() {
-        return {
-            Authorization: `token ${U.token.get()}`,
-            Accept: 'application/vnd.github+json'
-        };
-    },
+  /* ================= Snippets Tab ================= */
+  function drawSnippetsTab() {
+    contentDiv.innerHTML = "";
 
-    async api(path, opts = {}) {
-        const r = await fetch(CONFIG.githubApi + path, {
-            ...opts,
-            headers: { ...this.headers(), ...(opts.headers || {}) }
+    const editor = document.createElement("div");
+    editor.style.display = "flex";
+    editor.style.flexDirection = "column";
+    editor.style.gap = "6px";
+
+    const nameInput = document.createElement("input");
+    nameInput.placeholder = "Snippet Name";
+    nameInput.style.padding = "6px";
+
+    const codeArea = document.createElement("textarea");
+    codeArea.rows = 8;
+    codeArea.placeholder = "// JS Code";
+    codeArea.style.padding = "6px";
+
+    const targetSelect = document.createElement("select");
+    targetSelect.style.padding = "6px";
+    targetSelect.multiple = true;
+    targetSelect.size = 6;
+
+    const modeSelect = document.createElement("select");
+    ["manual", "start", "always"].forEach((m) => {
+      const o = document.createElement("option");
+      o.value = m;
+      o.textContent = m;
+      modeSelect.appendChild(o);
+    });
+
+    const saveBtn = document.createElement("button");
+    saveBtn.textContent = "Save + Run";
+
+    const delBtn = document.createElement("button");
+    delBtn.textContent = "Delete";
+
+    [saveBtn, delBtn].forEach((b) => {
+      b.style.padding = "6px";
+      b.style.borderRadius = "6px";
+      b.style.border = "none";
+      b.style.background = "#222";
+      b.style.color = "#fff";
+      editor.appendChild(b);
+    });
+
+    editor.appendChild(nameInput);
+    editor.appendChild(codeArea);
+    editor.appendChild(targetSelect);
+    editor.appendChild(modeSelect);
+    contentDiv.appendChild(editor);
+
+    function refreshTargets() {
+      const frames = collectFrames();
+      targetSelect.innerHTML = "";
+      frames.forEach((f) => {
+        const opt = document.createElement("option");
+        opt.value = f.id;
+        opt.textContent = f.id + (f.win ? "" : " [no-access]");
+        if (!f.win) opt.disabled = true;
+        targetSelect.appendChild(opt);
+      });
+    }
+    refreshTargets();
+
+    function runSnippetByIds(s) {
+      const frames = collectFrames();
+      const selectedIds = Array.from(targetSelect.selectedOptions).map(
+        (o) => o.value
+      );
+      if (!selectedIds.length) selectedIds.push("top"); // fallback top
+      let ran = 0;
+
+      selectedIds.forEach((tid) => {
+        if (tid === "top") ran += execInWindow(window, s.code) ? 1 : 0;
+        else {
+          const f = frames.find((x) => x.id === tid);
+          if (f) ran += execInWindow(f.win, s.code) ? 1 : 0;
+        }
+      });
+      toast(`Snippet ran in ${ran} frame(s)`);
+    }
+
+    saveBtn.onclick = () => {
+      const n = nameInput.value.trim();
+      if (!n) return toast("Provide name");
+      snippets[n] = {
+        name: n,
+        code: codeArea.value,
+        target: Array.from(targetSelect.selectedOptions).map((o) => o.value),
+        mode: modeSelect.value,
+      };
+      saveSnippets();
+      runSnippetByIds(snippets[n]);
+      refreshTargets();
+    };
+
+    delBtn.onclick = () => {
+      const n = nameInput.value.trim();
+      if (snippets[n]) {
+        delete snippets[n];
+        saveSnippets();
+        toast("Deleted");
+        refreshTargets();
+      } else toast("Not found");
+    };
+  }
+
+  /* ================= GitHub Loader ================= */
+  function drawGitHubTab() {
+    contentDiv.innerHTML = "";
+    const urlInput = document.createElement("input");
+    urlInput.placeholder = "GitHub Raw URL";
+    urlInput.style.width = "100%";
+    urlInput.style.padding = "6px";
+
+    const fetchBtn = document.createElement("button");
+    fetchBtn.textContent = "Fetch";
+    const copyBtn = document.createElement("button");
+    copyBtn.textContent = "Copy";
+    const saveBtn = document.createElement("button");
+    saveBtn.textContent = "Save as Snippet";
+
+    [fetchBtn, copyBtn, saveBtn].forEach((b) => {
+      b.style.padding = "6px";
+      b.style.borderRadius = "6px";
+      b.style.border = "none";
+      b.style.background = "#222";
+      b.style.color = "#fff";
+      b.style.marginRight = "4px";
+    });
+
+    const pre = document.createElement("pre");
+    pre.style.background = "#000";
+    pre.style.color = "#0f0";
+    pre.style.padding = "6px";
+    pre.style.overflowX = "auto";
+    pre.style.maxHeight = "300px";
+
+    contentDiv.append(urlInput, fetchBtn, copyBtn, saveBtn, pre);
+
+    fetchBtn.onclick = async () => {
+      const url = urlInput.value.trim();
+      if (!url) return toast("Enter URL");
+      try {
+        const txt = await fetch(url).then((r) => r.text());
+        pre.textContent = txt;
+        toast("Fetched");
+      } catch {
+        toast("Failed");
+      }
+    };
+    copyBtn.onclick = () => {
+      navigator.clipboard.writeText(pre.textContent).then(() => toast("Copied"));
+    };
+    saveBtn.onclick = () => {
+      const code = pre.textContent;
+      if (!code) return toast("No code");
+      const name = "GH_" + Math.floor(Math.random() * 9999);
+      snippets[name] = { name, code, target: ["top"], mode: "manual" };
+      saveSnippets();
+      toast("Saved snippet: " + name);
+    };
+  }
+
+  /* ================= Tab Switcher ================= */
+  function drawActiveTab() {
+    if (activeTab === "Frames") drawFrameTree();
+    else if (activeTab === "Snippets") drawSnippetsTab();
+    else if (activeTab === "GitHub") drawGitHubTab();
+  }
+
+  drawActiveTab();
+
+  /* ================= MutationObserver ================= */
+  let moTimer = null;
+  new MutationObserver(() => {
+    if (activeTab !== "Frames") return;
+    clearTimeout(moTimer);
+    moTimer = setTimeout(drawFrameTree, 200);
+  }).observe(document.body, { childList: true, subtree: true });
+
+  /* ================= Autorun Snippets ================= */
+  window.addEventListener("load", () => {
+    Object.values(snippets).forEach((s) => {
+      if (s.mode === "start" || s.mode === "always") {
+        injectEvalBridge(window);
+        const frames = collectFrames();
+        const targets = Array.isArray(s.target) ? s.target : [s.target];
+        targets.forEach((tid) => {
+          if (tid === "top") execInWindow(window, s.code);
+          else {
+            const f = frames.find((x) => x.id === tid);
+            f && execInWindow(f.win, s.code);
+          }
         });
-        if (!r.ok) throw new Error(await r.text());
-        return r.json();
-    },
-
-    async connect() {
-        const t = prompt('Paste GitHub PAT (repo scope)');
-        if (!t) return;
-        U.token.set(t);
-        state.github.user = await this.api('/user');
-        state.github.repos = await this.api('/user/repos?per_page=100');
-        renderRepos();
-        U.log(`Connected as ${state.github.user.login}`, 'ok');
-    },
-
-    async push() {
-        if (!state.github.repo) return alert('Select repo');
-        for (const [name, s] of Object.entries(state.snippets)) {
-            const path = `${CONFIG.repoDir}/${name}.js`;
-            const content = U.b64enc(s.code);
-            let sha;
-
-            try {
-                const f = await this.api(`/repos/${state.github.repo}/contents/${path}?ref=${state.github.branch}`);
-                sha = f.sha;
-            } catch {}
-
-            await this.api(`/repos/${state.github.repo}/contents/${path}`, {
-                method: 'PUT',
-                body: JSON.stringify({
-                    message: `Update ${name}`,
-                    content,
-                    branch: state.github.branch,
-                    sha
-                })
-            });
-        }
-        U.log('Pushed to GitHub', 'ok');
-    },
-
-    async pull() {
-        if (!state.github.repo) return;
-        const files = await this.api(
-            `/repos/${state.github.repo}/contents/${CONFIG.repoDir}?ref=${state.github.branch}`
-        );
-
-        for (const f of files.filter(x => x.name.endsWith('.js'))) {
-            const data = await this.api(`/repos/${state.github.repo}/contents/${f.path}`);
-            const remote = U.b64dec(data.content);
-            const name = f.name.replace(/\.js$/, '');
-            const local = state.snippets[name]?.code;
-
-            if (!local || local === remote) {
-                state.snippets[name] = { code: remote };
-            } else {
-                Diff.prompt(name, local, remote);
-            }
-        }
-        U.save();
-        renderList();
-        U.log('Pull complete', 'ok');
-    }
-};
-
-/* ================= DIFF ================= */
-const Diff = {
-    prompt(name, local, remote) {
-        const w = window.open('', '_blank', 'width=900,height=600');
-        w.document.write(`
-<style>
-body{font-family:monospace;display:flex}
-pre{width:50%;padding:10px;overflow:auto}
-.l{background:#fee2e2}.r{background:#dcfce7}
-button{position:fixed;bottom:10px;left:10px}
-</style>
-<pre class="l">${esc(local)}</pre>
-<pre class="r">${esc(remote)}</pre>
-<button>Overwrite</button>
-`);
-        w.document.querySelector('button').onclick = () => {
-            state.snippets[name] = { code: remote };
-            U.save();
-            renderList();
-            w.close();
-        };
-    }
-};
-
-function esc(s) {
-    return s.replace(/[&<>]/g, c =>
-        ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c])
-    );
-}
-
-/* ================= UI ================= */
-function UI() {
-document.body.insertAdjacentHTML('beforeend', `
-<style>
-#se{position:fixed;bottom:10px;right:10px;width:420px;height:520px;
-background:#fff;border-radius:12px;box-shadow:0 20px 40px #0003;
-font-family:sans-serif;z-index:999999;display:flex;flex-direction:column}
-#se h{background:#6366f1;color:#fff;padding:10px;font-weight:700;cursor:move}
-#se c{flex:1;padding:10px;overflow:auto}
-textarea{width:100%;height:120px}
-.log.ok{color:green}.log.err{color:red}
-</style>
-
-<div id="se">
-<h>Script Executor Pro</h>
-<c>
-<input id="name" placeholder="Snippet name"><br>
-<textarea id="code"></textarea>
-<button id="save">Save</button>
-<button id="run">Run</button>
-<hr>
-<button id="gh">GitHub</button>
-<button id="push">Push</button>
-<button id="pull">Pull</button>
-<button id="autosync">AutoSync: ON</button>
-<br>
-<select id="repo"></select>
-<input id="branch" value="main">
-<hr>
-<div id="list"></div>
-<hr>
-<div id="log"></div>
-</c>
-</div>
-`);
-}
-
-/* ================= RENDER ================= */
-function renderList() {
-    const l = document.getElementById('list');
-    l.innerHTML = '';
-    Object.entries(state.snippets).forEach(([k, v]) => {
-        const d = document.createElement('div');
-        d.innerHTML = `<b>${k}</b> <button>▶</button> <button>✕</button>`;
-        const [r, x] = d.querySelectorAll('button');
-        r.onclick = () => execute(v.code, 'top');
-        x.onclick = () => {
-            delete state.snippets[k];
-            U.save();
-            renderList();
-        };
-        l.appendChild(d);
+      }
     });
-}
-
-function renderRepos() {
-    const s = document.getElementById('repo');
-    s.innerHTML = '';
-    state.github.repos.forEach(r => {
-        const o = document.createElement('option');
-        o.value = r.full_name;
-        o.textContent = r.full_name;
-        s.appendChild(o);
-    });
-    s.onchange = e => state.github.repo = e.target.value;
-    state.github.repo = s.value;
-}
-
-/* ================= AUTO SYNC ================= */
-async function autoSync() {
-    if (!CONFIG.autoSyncOnLoad) return;
-    if (!state.github.autoSync) return;
-    if (!U.token.get()) return;
-    try {
-        await GitHub.pull();
-        U.log('Auto-sync done', 'ok');
-    } catch (e) {
-        U.log('Auto-sync failed', 'err');
-    }
-}
-
-/* ================= INIT ================= */
-function init() {
-    UI();
-    state.snippets = U.load();
-    renderList();
-
-    document.getElementById('save').onclick = () => {
-        state.snippets[name.value] = { code: code.value };
-        U.save();
-        renderList();
-    };
-
-    document.getElementById('run').onclick = () => execute(code.value, 'top');
-    document.getElementById('gh').onclick = () => GitHub.connect();
-    document.getElementById('push').onclick = () => GitHub.push();
-    document.getElementById('pull').onclick = () => GitHub.pull();
-
-    document.getElementById('autosync').onclick = e => {
-        state.github.autoSync = !state.github.autoSync;
-        e.target.textContent =
-            'AutoSync: ' + (state.github.autoSync ? 'ON' : 'OFF');
-    };
-
-    setTimeout(autoSync, CONFIG.autoSyncDelay);
-}
-
-init();
+  });
 })();
