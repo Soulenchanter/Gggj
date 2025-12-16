@@ -1,0 +1,198 @@
+(function () {
+'use strict';
+
+/* ============================================================
+   SCRIPT EXECUTOR PRO — FINAL
+   ============================================================ */
+
+/* ================= CONFIG ================= */
+const CONFIG = {
+    storageKey: 'se_snippets_v3',
+    githubTokenKey: 'se_github_token',
+    githubApi: 'https://api.github.com',
+    defaultDir: 'script-executor'
+};
+
+/* ================= STATE ================= */
+const state = {
+    snippets: {},
+    frames: {},
+    github: {
+        user: null,
+        repos: [],
+        repo: null,
+        branch: 'main'
+    }
+};
+
+/* ================= UTILS ================= */
+const U = {
+    id: () => Math.random().toString(36).slice(2),
+    save: () => localStorage.setItem(CONFIG.storageKey, JSON.stringify(state.snippets)),
+    load: () => JSON.parse(localStorage.getItem(CONFIG.storageKey) || '{}'),
+    token: {
+        get: () => localStorage.getItem(CONFIG.githubTokenKey),
+        set: t => t
+            ? localStorage.setItem(CONFIG.githubTokenKey, t)
+            : localStorage.removeItem(CONFIG.githubTokenKey)
+    },
+    log(msg, type='info') {
+        const el = document.createElement('div');
+        el.className = `se-log-entry ${type}`;
+        el.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+        document.getElementById('seLog').appendChild(el);
+    }
+};
+
+/* ================= GITHUB ================= */
+const GitHub = {
+    headers() {
+        return {
+            Authorization: `token ${U.token.get()}`,
+            Accept: 'application/vnd.github+json'
+        };
+    },
+
+    async api(path, opts={}) {
+        const r = await fetch(CONFIG.githubApi + path, {
+            ...opts,
+            headers: { ...this.headers(), ...(opts.headers||{}) }
+        });
+        if (!r.ok) throw new Error(await r.text());
+        return r.json();
+    },
+
+    async connect() {
+        const t = prompt('Paste GitHub PAT (repo scope)');
+        if (!t) return;
+        U.token.set(t);
+        state.github.user = await this.api('/user');
+        state.github.repos = await this.api('/user/repos?per_page=100');
+        U.log(`Connected as ${state.github.user.login}`, 'success');
+        renderGitHubUI();
+    },
+
+    async pushSnippets() {
+        const repo = state.github.repo;
+        const branch = state.github.branch;
+        if (!repo) return alert('Select repository');
+
+        for (const [name, s] of Object.entries(state.snippets)) {
+            const path = `${CONFIG.defaultDir}/${name}.js`;
+            const content = btoa(unescape(encodeURIComponent(s.code)));
+
+            let sha;
+            try {
+                const f = await this.api(`/repos/${repo}/contents/${path}?ref=${branch}`);
+                sha = f.sha;
+            } catch {}
+
+            await this.api(`/repos/${repo}/contents/${path}`, {
+                method: 'PUT',
+                body: JSON.stringify({
+                    message: `Update ${name}`,
+                    content,
+                    branch,
+                    sha
+                })
+            });
+        }
+        U.log('Pushed snippets to GitHub', 'success');
+    }
+};
+
+/* ================= EXECUTOR ================= */
+function exec(code, ctx) {
+    try {
+        ctx === 'top'
+            ? eval(code)
+            : state.frames[ctx]?.contentWindow.eval(code);
+        U.log('Executed', 'success');
+    } catch (e) {
+        U.log(e.message, 'error');
+    }
+}
+
+/* ================= UI ================= */
+function UI() {
+document.body.insertAdjacentHTML('beforeend', `
+<style>
+.se{position:fixed;bottom:10px;right:10px;width:420px;height:520px;
+background:#fff;border-radius:12px;box-shadow:0 20px 40px #0003;
+font-family:sans-serif;z-index:999999;display:flex;flex-direction:column}
+.se h{padding:10px;background:#6366f1;color:#fff;font-weight:700}
+.se c{flex:1;padding:10px;overflow:auto}
+.se textarea{width:100%;height:120px}
+.se button{margin:4px}
+.se-log-entry.success{color:green}
+.se-log-entry.error{color:red}
+</style>
+
+<div class="se">
+<h>Script Executor Pro</h>
+<c>
+<input id="n" placeholder="Snippet name"><br>
+<textarea id="code"></textarea><br>
+<button id="save">Save</button>
+<button id="run">Run</button>
+<button id="gh">GitHub</button>
+<button id="push">Push</button>
+<hr>
+<select id="repo"></select>
+<input id="branch" value="main">
+<hr>
+<div id="list"></div>
+<hr>
+<div id="seLog"></div>
+</c>
+</div>
+`);
+}
+
+/* ================= RENDER ================= */
+function renderList() {
+    const l = document.getElementById('list');
+    l.innerHTML='';
+    Object.entries(state.snippets).forEach(([k,v])=>{
+        const d=document.createElement('div');
+        d.innerHTML=`<b>${k}</b>
+        <button>▶</button>
+        <button>✕</button>`;
+        const [r,x]=d.querySelectorAll('button');
+        r.onclick=()=>exec(v.code,'top');
+        x.onclick=()=>{delete state.snippets[k];U.save();renderList();};
+        l.appendChild(d);
+    });
+}
+
+function renderGitHubUI() {
+    const sel = document.getElementById('repo');
+    sel.innerHTML='';
+    state.github.repos.forEach(r=>{
+        const o=document.createElement('option');
+        o.value=r.full_name;
+        o.textContent=r.full_name;
+        sel.appendChild(o);
+    });
+    sel.onchange=e=>state.github.repo=e.target.value;
+    state.github.repo=sel.value;
+}
+
+/* ================= INIT ================= */
+function init() {
+    UI();
+    state.snippets = U.load();
+    renderList();
+
+    document.getElementById('save').onclick=()=>{
+        state.snippets[n.value]={code:code.value};
+        U.save(); renderList();
+    };
+
+    document.getElementById('run').onclick=()=>exec(code.value,'top');
+    document.getElementById('gh').onclick=()=>GitHub.connect();
+    document.getElementById('push').onclick=()=>GitHub.pushSnippets();
+}
+
+init();
+})();
