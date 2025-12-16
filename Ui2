@@ -1,374 +1,1346 @@
-/* Unified Rain Claim + STOMP/WS Hooks
-   - Standalone script to run on page load or via Snippets tab
-   - Posts structured messages via postMessage for overlay consumption
-   - Exposes window.NI_RAIN API: start(), stop(), runOnce(), status()
-   - Designed to be safe: will not silently exfiltrate data; use responsibly
-*/
-(function NI_Rain_Global(){
-  if (window.__NI_RAIN_LOADED__) return;
-  window.__NI_RAIN_LOADED__ = true;
-
-  // ================== CONFIG ==================
-  const cfg = {
-    autostart: false,              // if true, starts the recurring claim loop on load
-    intervalMs: 30_000,            // default loop interval
-    maxRetries: 3,
-    baseDelayMs: 800,
-    timeoutMs: 12_000,
-    preferFetch: true,
-    followRedirect: true,
-    claimEndpoint: null,           // override endpoint (string). If null, auto-derive
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    expectJsonResponse: true,
-    wsFallback: false,             // try WS fallback if HTTP fails
-    wsUrl: null,                   // optional WS url for fallback
-    wsPayload: null,               // optional WS payload for fallback
-    verbose: false,                // extra console logging
-  };
-
-  // volatile runtime state
-  const state = {
-    running: false,
-    timer: null,
-    stats: { attempts: 0, successes: 0 },
-    lastResult: null
-  };
-
-  // ================== UTILITIES ==================
-  const nowIso = () => new Date().toISOString();
-
-  function logLocal(type, payload){
-    const message = { ni: true, source: 'rain', type, payload, ts: nowIso() };
-    try {
-      window.postMessage(message, '*');
-      if (window.top && window.top !== window) {
-        // also post to top for overlays living in top window
-        try { window.top.postMessage(message, '*'); } catch(e) {}
-      }
-    } catch(e){ /* ignore */ }
-    if (cfg.verbose) console.debug("[NI_RAIN]", type, payload);
-  }
-
-  function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
-
-  function promiseTimeout(p, ms){
-    let id;
-    const timeout = new Promise((_, reject) => id = setTimeout(()=>reject(new Error("timeout")), ms));
-    return Promise.race([p, timeout]).finally(()=> clearTimeout(id));
-  }
-
-  function backoffDelay(attempt){
-    const base = cfg.baseDelayMs * Math.pow(1.8, attempt);
-    return base + Math.floor(Math.random() * (base * 0.3));
-  }
-
-  // safe previewer for bodies (stringify / text)
-  function previewBody(b, max=800){
-    try {
-      if (b === undefined || b === null) return null;
-      if (typeof b === 'string') return b.length > max ? b.slice(0,max) + '...' : b;
-      if (b instanceof Blob || b instanceof ArrayBuffer || ArrayBuffer.isView(b)) return `[Binary ${b.size || b.byteLength || 'N/A'}]`;
-      // try JSON
-      return JSON.stringify(b).slice(0, max) + (JSON.stringify(b).length > max ? '...' : '');
-    } catch(e){ return String(b).slice(0, max); }
-  }
-
-  // ================== NETWORK ATTEMPT HELPERS ==================
-  async function attemptFetch(url, body, headers, method){
-    const opts = { method: method || cfg.method, headers: headers || cfg.headers, cache: "no-store", redirect: cfg.followRedirect ? "follow" : "manual" };
-    if (body !== undefined && body !== null) opts.body = body;
-    const resp = await promiseTimeout(fetch(url, opts), cfg.timeoutMs);
-    const status = resp.status;
-    let text = null, json = null;
-    try { text = await resp.clone().text().catch(()=>null); } catch(e){}
-    try { json = await resp.clone().json().catch(()=>null); } catch(e){}
-    return { status, text, json, resp };
-  }
-
-  function attemptXHR(url, body, headers, method){
-    return new Promise((resolve, reject) => {
-      try {
-        const xhr = new XMLHttpRequest();
-        xhr.open(method || cfg.method, url, true);
-        for (const k in (headers || {})) try { xhr.setRequestHeader(k, headers[k]); } catch(e){}
-        xhr.timeout = cfg.timeoutMs;
-        xhr.onload = () => resolve({ status: xhr.status, text: xhr.responseText, resp: xhr });
-        xhr.onerror = () => reject(new Error("xhr error"));
-        xhr.ontimeout = () => reject(new Error("xhr timeout"));
-        xhr.send(body === undefined ? null : body);
-      } catch (e) { reject(e); }
-    });
-  }
-
-  // heuristic for success (tune per-site)
-  function defaultSuccessHeuristic(text, status, json){
-    if (status >= 200 && status < 300) return true;
-    if (json && (json.success || json.result === "ok" || json.status === "ok")) return true;
-    if (typeof text === "string" && /success|claimed|ok|won/i.test(text)) return true;
-    return false;
-  }
-
-  // try to auto-derive endpoint or body from page
-  function autoDerive(){
-    try {
-      // common patterns
-      if (window.claimUrl) return { url: window.claimUrl };
-      if (window.__CLAIM_ENDPOINT) return { url: window.__CLAIM_ENDPOINT };
-      // form-based
-      const btn = document.querySelector('button[data-claim], button.claim, button[id*="claim"], [data-claim="true"]');
-      if (btn && btn.form){
-        const f = btn.form;
-        const action = f.action || location.href;
-        const data = new FormData(f);
-        return { url: action, body: new URLSearchParams(data).toString(), headers: { "Content-Type": "application/x-www-form-urlencoded" }, method: "POST" };
-      }
-    } catch(e){}
-    return {};
-  }
-
-  // orchestrate attempts with retries/backoff
-  async function runAttemptOnce(opts = {}){
-    const derived = autoDerive();
-    const url = opts.claimEndpoint || cfg.claimEndpoint || derived.url || null;
-    let body = opts.getBody ? await opts.getBody() : (derived.body || opts.body || null);
-    let headers = Object.assign({}, cfg.headers, derived.headers || {}, opts.headers || {});
-    const method = opts.method || cfg.method || derived.method || "POST";
-
-    if (!url) {
-      logLocal('claim_result', { id: null, success:false, info: 'no-endpoint', ts: nowIso() });
-      return { success:false, reason: 'no-endpoint' };
-    }
-
-    const runId = `ni-rain-${Date.now().toString(36)}-${Math.random().toString(36).slice(2,8)}`;
-    logLocal('claim_attempt', { id: runId, cfg: { method, headers }, request: { url, method, bodyPreview: previewBody(body) }, ts: nowIso() });
-
-    // attempt loop
-    for (let attempt = 0; attempt < (opts.maxRetries || cfg.maxRetries || 3); attempt++){
-      try {
-        let sendBody = body;
-        if (sendBody && typeof sendBody === 'object' && headers["Content-Type"] && headers["Content-Type"].includes("application/json")) {
-          try { sendBody = JSON.stringify(sendBody); } catch(e){}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>iframe Script Executor - Live Site Context</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
         }
 
-        let res;
-        if (cfg.preferFetch && window.fetch) res = await attemptFetch(url, sendBody, headers, method);
-        else res = await attemptXHR(url, sendBody, headers, method);
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
 
-        const ok = (opts.successHeuristic || defaultSuccessHeuristic)(res.text, res.status, res.json);
-        const result = { id: runId, attempt, success: !!ok, info: ok ? 'claimed' : 'rejected', response: { status: res.status, textSnippet: (res.text||'').slice(0,1000), json: res.json||null }, ts: nowIso() };
+        /* Overlay Styles */
+        .overlay {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            width: 700px;
+            height: 600px;
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            display: flex;
+            flex-direction: column;
+            z-index: 10000;
+            overflow: hidden;
+            transition: all 0.3s ease;
+        }
 
-        // stats
-        state.stats.attempts++;
-        if (ok) state.stats.successes++;
+        .overlay.minimized {
+            width: auto;
+            height: auto;
+            bottom: 20px;
+            right: 20px;
+        }
 
-        logLocal('claim_result', result);
-        state.lastResult = result;
-        return result;
-      } catch (err) {
-        logLocal('claim_error', { id: runId, attempt, error: String(err), ts: nowIso() });
-        const wait = backoffDelay(attempt);
-        await sleep(wait);
-        continue;
-      }
-    }
+        .overlay-header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 15px 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            cursor: move;
+            user-select: none;
+            border-radius: 12px 12px 0 0;
+        }
 
-    // failed after retries
-    const fail = { id: runId, success:false, info: 'failed_after_retries', ts: nowIso() };
-    state.stats.attempts++;
-    logLocal('claim_result', fail);
-    state.lastResult = fail;
-    return fail;
-  }
+        .overlay.minimized .overlay-header {
+            border-radius: 50%;
+            width: 50px;
+            height: 50px;
+            padding: 0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
 
-  // optionally also do a WS fallback
-  async function attemptWsFallback(payloadString){
-    if (!cfg.wsFallback || !cfg.wsUrl) return { success:false, info: 'no-ws-fallback' };
-    try {
-      const wsRes = await new Promise((resolve, reject) => {
-        try {
-          const ws = new WebSocket(cfg.wsUrl);
-          const t = setTimeout(()=>{ try{ ws.close(); }catch(e){}; reject(new Error("ws timeout")); }, cfg.timeoutMs);
-          ws.addEventListener('open', ()=> ws.send(payloadString));
-          ws.addEventListener('message', ev => { clearTimeout(t); resolve({ text: typeof ev.data === 'string' ? ev.data : null, data: ev.data }); });
-          ws.addEventListener('error', e => { clearTimeout(t); reject(e); });
-        } catch(e) { reject(e); }
-      });
-      const ok = /success|claimed|ok/i.test(wsRes.text || '');
-      const resObj = { id: `ws-fallback-${Date.now().toString(36)}`, success: !!ok, info: 'ws_fallback', payload: wsRes, ts: nowIso() };
-      if (ok) state.stats.successes++;
-      state.stats.attempts++;
-      logLocal('claim_result', resObj);
-      return resObj;
-    } catch (e) {
-      logLocal('claim_result', { id: `ws-fallback-${Date.now().toString(36)}`, success:false, info: 'ws_fallback_error', error:String(e), ts: nowIso() });
-      return { success:false, error:String(e) };
-    }
-  }
+        .overlay-title {
+            font-weight: 600;
+            font-size: 14px;
+        }
 
-  // ================== WS/STOMP HOOKS ==================
-  // Helpers to detect SockJS and STOMP frames and attach listening
-  function tryPatchWebSocket(){
-    try {
-      if (!window.WebSocket) return;
-      if (window.__NI_RAIN_WS_PATCHED__) return;
-      window.__NI_RAIN_WS_PATCHED__ = true;
+        .overlay.minimized .overlay-title {
+            display: none;
+        }
 
-      const OrigWS = window.WebSocket;
-      function wrapConstructor(url, protocols){
-        const ws = protocols ? new OrigWS(url, protocols) : new OrigWS(url);
-        tryPatchInstance(ws, url);
-        return ws;
-      }
-      // copy prototype/props
-      wrapConstructor.prototype = OrigWS.prototype;
-      window.WebSocket = wrapConstructor;
+        .user-badge {
+            background: rgba(255, 255, 255, 0.2);
+            padding: 4px 10px;
+            border-radius: 12px;
+            font-size: 11px;
+            font-weight: 500;
+            margin-left: auto;
+        }
 
-      function tryPatchInstance(ws, url){
-        if (!ws) return;
-        const origSend = ws.send.bind(ws);
-        ws.send = function(data){
-          try {
-            let preview = (typeof data === 'string') ? data.slice(0,1000) : `[binary ${data && data.byteLength? data.byteLength : 'N/A'}]`;
-            logLocal('ws_send', { url, dataPreview: preview, binary: !(typeof data === 'string'), ts: nowIso() });
-            // STOMP: if text and begins with STOMP commands, parse
-            if (typeof data === 'string' && isLikelyStompFrame(data)) {
-              const parsed = parseStompFrame(data);
-              logLocal('stomp_frame', Object.assign({ url, direction: 'send' }, parsed));
+        .overlay.minimized .user-badge {
+            display: none;
+        }
+
+        .overlay-controls {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+
+        .overlay.minimized .overlay-controls button:not(.minimize-btn) {
+            display: none;
+        }
+
+        button {
+            background: none;
+            border: none;
+            color: white;
+            cursor: pointer;
+            font-size: 16px;
+            padding: 5px 10px;
+            border-radius: 4px;
+            transition: background 0.2s;
+        }
+
+        button:hover {
+            background: rgba(255, 255, 255, 0.2);
+        }
+
+        .resize-handle {
+            position: absolute;
+            bottom: 0;
+            right: 0;
+            width: 20px;
+            height: 20px;
+            cursor: nwse-resize;
+            background: linear-gradient(135deg, transparent 50%, #667eea 50%);
+            border-radius: 0 0 12px 0;
+        }
+
+        .overlay.minimized .resize-handle {
+            display: none;
+        }
+
+        /* Content Area */
+        .overlay-content {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            background: white;
+            padding: 20px;
+            gap: 15px;
+        }
+
+        .overlay.minimized .overlay-content {
+            display: none;
+        }
+
+        /* Tabs */
+        .tabs {
+            display: flex;
+            gap: 5px;
+            border-bottom: 2px solid #e0e0e0;
+        }
+
+        .tab-btn {
+            background: none;
+            border: none;
+            padding: 10px 15px;
+            cursor: pointer;
+            color: #999;
+            font-weight: 500;
+            font-size: 13px;
+            border-bottom: 2px solid transparent;
+            transition: all 0.2s;
+        }
+
+        .tab-btn.active {
+            color: #667eea;
+            border-bottom-color: #667eea;
+        }
+
+        .tab-content {
+            display: none;
+            flex: 1;
+            overflow-y: auto;
+            flex-direction: column;
+            gap: 15px;
+        }
+
+        .tab-content.active {
+            display: flex;
+        }
+
+        /* Context Selector */
+        .context-selector {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+
+        .context-selector label {
+            font-weight: 500;
+            color: #333;
+            font-size: 13px;
+            white-space: nowrap;
+        }
+
+        .context-selector select {
+            flex: 1;
+            padding: 8px 12px;
+            border: 2px solid #e0e0e0;
+            border-radius: 6px;
+            font-size: 13px;
+            background: white;
+            cursor: pointer;
+            transition: border-color 0.2s;
+        }
+
+        .context-selector select:hover {
+            border-color: #667eea;
+        }
+
+        .context-selector select:focus {
+            outline: none;
+            border-color: #667eea;
+            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+        }
+
+        /* Execution Mode */
+        .execution-mode {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+
+        .execution-mode label {
+            font-weight: 500;
+            color: #333;
+            font-size: 13px;
+        }
+
+        .radio-group {
+            display: flex;
+            gap: 15px;
+        }
+
+        .radio-group label {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            font-weight: 400;
+            cursor: pointer;
+            font-size: 13px;
+        }
+
+        .radio-group input[type="radio"] {
+            cursor: pointer;
+            width: 14px;
+            height: 14px;
+        }
+
+        /* Script Textarea */
+        .script-input {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            min-height: 0;
+        }
+
+        .script-input label {
+            font-weight: 500;
+            color: #333;
+            font-size: 13px;
+        }
+
+        .script-input textarea {
+            flex: 1;
+            padding: 12px;
+            border: 2px solid #e0e0e0;
+            border-radius: 6px;
+            font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+            font-size: 12px;
+            resize: none;
+            background: #f5f5f5;
+            transition: border-color 0.2s;
+            min-height: 0;
+        }
+
+        .script-input textarea:focus {
+            outline: none;
+            border-color: #667eea;
+            background: white;
+        }
+
+        /* Live Insert */
+        .live-insert-panel {
+            gap: 12px;
+        }
+
+        .live-insert-section {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .live-insert-section h4 {
+            color: #333;
+            font-size: 12px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .quick-snippet-btn {
+            padding: 8px 12px;
+            background: #f0f0f0;
+            border: 1px solid #e0e0e0;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 12px;
+            color: #333;
+            font-weight: 500;
+            transition: all 0.2s;
+            text-align: left;
+        }
+
+        .quick-snippet-btn:hover {
+            background: #e8e8e8;
+            border-color: #667eea;
+        }
+
+        .quick-snippet-btn.active {
+            background: #667eea;
+            color: white;
+            border-color: #667eea;
+        }
+
+        .live-insert-input {
+            display: flex;
+            gap: 8px;
+        }
+
+        .live-insert-input input {
+            flex: 1;
+            padding: 8px 12px;
+            border: 2px solid #e0e0e0;
+            border-radius: 6px;
+            font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+            font-size: 12px;
+            transition: border-color 0.2s;
+        }
+
+        .live-insert-input input:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        .live-insert-input button {
+            padding: 8px 12px;
+            background: #667eea;
+            border: none;
+            border-radius: 6px;
+            color: white;
+            cursor: pointer;
+            font-weight: 500;
+            font-size: 12px;
+            transition: all 0.2s;
+        }
+
+        .live-insert-input button:hover {
+            background: #764ba2;
+            transform: translateY(-2px);
+        }
+
+        .code-preview {
+            background: #2d2d2d;
+            color: #f8f8f2;
+            padding: 12px;
+            border-radius: 6px;
+            font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+            font-size: 11px;
+            overflow-x: auto;
+            max-height: 120px;
+            overflow-y: auto;
+            border: 1px solid #444;
+            word-break: break-all;
+            white-space: pre-wrap;
+        }
+
+        /* Log Panel */
+        .log-panel {
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .log-entries {
+            flex: 1;
+            overflow-y: auto;
+            border: 1px solid #e0e0e0;
+            border-radius: 6px;
+            background: #f9f9f9;
+            min-height: 0;
+        }
+
+        .log-entry {
+            padding: 10px 12px;
+            border-bottom: 1px solid #e0e0e0;
+            font-size: 12px;
+            font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+        }
+
+        .log-entry:last-child {
+            border-bottom: none;
+        }
+
+        .log-entry.success {
+            background: #d4edda;
+            color: #155724;
+        }
+
+        .log-entry.error {
+            background: #f8d7da;
+            color: #721c24;
+        }
+
+        .log-entry.info {
+            background: #d1ecf1;
+            color: #0c5460;
+        }
+
+        .log-entry.warning {
+            background: #fff3cd;
+            color: #856404;
+        }
+
+        .log-timestamp {
+            opacity: 0.7;
+            font-size: 10px;
+        }
+
+        /* Communication Panel */
+        .communication-panel {
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .comm-status {
+            padding: 12px;
+            background: #d1ecf1;
+            border: 1px solid #bee5eb;
+            border-radius: 6px;
+            font-size: 12px;
+            color: #0c5460;
+        }
+
+        .comm-status.connected {
+            background: #d4edda;
+            border-color: #c3e6cb;
+            color: #155724;
+        }
+
+        .comm-items {
+            flex: 1;
+            overflow-y: auto;
+            border: 1px solid #e0e0e0;
+            border-radius: 6px;
+            background: #f9f9f9;
+            min-height: 0;
+        }
+
+        .comm-item {
+            padding: 10px 12px;
+            border-bottom: 1px solid #e0e0e0;
+            font-size: 11px;
+            font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+        }
+
+        .comm-item:last-child {
+            border-bottom: none;
+        }
+
+        .comm-item.sent {
+            background: #e3f2fd;
+        }
+
+        .comm-item.received {
+            background: #f3e5f5;
+        }
+
+        .comm-direction {
+            color: #667eea;
+            font-weight: 600;
+        }
+
+        /* Action Buttons */
+        .action-buttons {
+            display: flex;
+            gap: 10px;
+        }
+
+        .action-buttons button {
+            flex: 1;
+            padding: 10px 16px;
+            border: none;
+            border-radius: 6px;
+            font-weight: 500;
+            font-size: 13px;
+            cursor: pointer;
+            transition: all 0.2s;
+            color: white;
+        }
+
+        .action-buttons .execute-btn {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        }
+
+        .action-buttons .execute-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px rgba(102, 126, 234, 0.3);
+        }
+
+        .action-buttons .reload-inject-btn {
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+        }
+
+        .action-buttons .reload-inject-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px rgba(245, 87, 108, 0.3);
+        }
+
+        .action-buttons .clear-btn {
+            background: #e0e0e0;
+            color: #333;
+        }
+
+        .action-buttons .clear-btn:hover {
+            background: #d0d0d0;
+        }
+
+        .action-buttons .clear-log-btn {
+            background: #ff6b6b;
+        }
+
+        .action-buttons .clear-log-btn:hover {
+            background: #ff5252;
+        }
+
+        /* Status Messages */
+        .status-message {
+            padding: 10px 12px;
+            border-radius: 6px;
+            font-size: 12px;
+            display: none;
+            animation: slideIn 0.3s ease;
+        }
+
+        .status-message.show {
+            display: block;
+        }
+
+        .status-message.success {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+
+        .status-message.error {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+
+        .status-message.info {
+            background: #d1ecf1;
+            color: #0c5460;
+            border: 1px solid #bee5eb;
+        }
+
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateY(-10px);
             }
-          } catch(e){}
-          return origSend(data);
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .context-info {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+            padding: 12px;
+            background: #f5f5f5;
+            border-radius: 6px;
+            font-size: 11px;
+        }
+
+        .context-info-item {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+
+        .context-info-label {
+            color: #666;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .context-info-value {
+            color: #333;
+            font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+            word-break: break-all;
+        }
+    </style>
+</head>
+<body>
+    <!-- Overlay -->
+    <div class="overlay" id="overlay">
+        <div class="overlay-header" id="overlayHeader">
+            <span class="overlay-title">⚙️ Script Executor</span>
+            <span class="user-badge">👤 Soulenchanter | 2025-12-16</span>
+            <div class="overlay-controls">
+                <button class="minimize-btn" id="minimizeBtn" title="Minimize">−</button>
+                <button id="closeBtn" title="Close">×</button>
+            </div>
+        </div>
+
+        <div class="overlay-content">
+            <!-- Tabs -->
+            <div class="tabs">
+                <button class="tab-btn active" data-tab="script">Script Input</button>
+                <button class="tab-btn" data-tab="live">Live Insert</button>
+                <button class="tab-btn" data-tab="log">Execution Log</button>
+                <button class="tab-btn" data-tab="comm">Communications</button>
+            </div>
+
+            <!-- Tab 1: Script Input -->
+            <div class="tab-content active script-panel" id="script-tab">
+                <div class="context-selector">
+                    <label for="contextSelect">Context/Frame:</label>
+                    <select id="contextSelect">
+                        <option value="">Select a context...</option>
+                    </select>
+                </div>
+
+                <div class="context-info" id="contextInfo" style="display: none;">
+                    <div class="context-info-item">
+                        <span class="context-info-label">Frame Name</span>
+                        <span class="context-info-value" id="infoFrameName">-</span>
+                    </div>
+                    <div class="context-info-item">
+                        <span class="context-info-label">Frame URL</span>
+                        <span class="context-info-value" id="infoFrameUrl">-</span>
+                    </div>
+                    <div class="context-info-item">
+                        <span class="context-info-label">Accessible</span>
+                        <span class="context-info-value" id="infoAccessible">-</span>
+                    </div>
+                    <div class="context-info-item">
+                        <span class="context-info-label">Connection</span>
+                        <span class="context-info-value" id="infoConnection">-</span>
+                    </div>
+                </div>
+
+                <div class="execution-mode">
+                    <label>Execution Method:</label>
+                    <div class="radio-group">
+                        <label>
+                            <input type="radio" name="executionMode" value="reload" checked>
+                            Reload & Inject
+                        </label>
+                        <label>
+                            <input type="radio" name="executionMode" value="onload">
+                            On Load (1s)
+                        </label>
+                        <label>
+                            <input type="radio" name="executionMode" value="onidle">
+                            On Idle (20s)
+                        </label>
+                    </div>
+                </div>
+
+                <div class="script-input">
+                    <label for="scriptTextarea">Script:</label>
+                    <textarea id="scriptTextarea" placeholder="// Paste your script here&#10;// Will be executed with full parent-child communication&#10;// Example: console.log('Hello from iframe!');"></textarea>
+                </div>
+
+                <div class="status-message" id="statusMessage"></div>
+
+                <div class="action-buttons">
+                    <button class="reload-inject-btn" id="reloadInjectBtn">🔄 Reload & Inject</button>
+                    <button class="execute-btn" id="executeBtn">▶ Execute</button>
+                    <button class="clear-btn" id="clearBtn">Clear</button>
+                </div>
+            </div>
+
+            <!-- Tab 2: Live Insert -->
+            <div class="tab-content live-insert-panel" id="live-tab">
+                <div class="live-insert-section">
+                    <h4>Quick Snippets</h4>
+                    <button class="quick-snippet-btn" data-snippet="console.log('Frame:', window.name || 'top', 'User: Soulenchanter', 'Date:', new Date().toISOString());">📝 Log Frame Info</button>
+                    <button class="quick-snippet-btn" data-snippet="document.body.style.backgroundColor = '#fff3cd'; console.log('BG changed to yellow');">🎨 Yellow BG</button>
+                    <button class="quick-snippet-btn" data-snippet="document.body.insertAdjacentHTML('afterbegin', '<div style=\"background: #667eea; color: white; padding: 20px; text-align: center; border-radius: 8px; margin: 10px;\"><h2>🚀 Live Injected by ' + (window.__SCRIPT_EXECUTOR_USER || 'Soulenchanter') + '</h2></div>');">🚀 Insert Banner</button>
+                    <button class="quick-snippet-btn" data-snippet="console.log('All elements in frame:', document.querySelectorAll('*').length); console.log('Current URL:', window.location.href);">📊 Page Stats</button>
+                </div>
+
+                <div class="live-insert-section">
+                    <h4>Custom Script</h4>
+                    <div class="live-insert-input">
+                        <input type="text" id="liveScriptInput" placeholder="Enter JavaScript code...">
+                        <button id="liveInsertBtn">Insert Live</button>
+                    </div>
+                </div>
+
+                <div class="live-insert-section">
+                    <h4>Code Preview</h4>
+                    <div class="code-preview" id="codePreview">// Code preview will appear here...</div>
+                </div>
+            </div>
+
+            <!-- Tab 3: Execution Log -->
+            <div class="tab-content log-panel" id="log-tab">
+                <div class="log-entries" id="logEntries">
+                    <div class="log-entry info">
+                        <span class="log-timestamp">[System]</span> Executor initialized | User: Soulenchanter | Date: 2025-12-16
+                    </div>
+                </div>
+
+                <div class="action-buttons">
+                    <button class="clear-log-btn" id="clearLogBtn">Clear Log</button>
+                </div>
+            </div>
+
+            <!-- Tab 4: Communications -->
+            <div class="tab-content communication-panel" id="comm-tab">
+                <div class="comm-status" id="commStatus">
+                    🔴 No connections active
+                </div>
+
+                <div class="comm-items" id="commItems">
+                    <div class="comm-item info">
+                        <span class="log-timestamp">[System]</span> Communication channel initialized. Listening for postMessage events...
+                    </div>
+                </div>
+
+                <div class="action-buttons">
+                    <button class="clear-log-btn" id="clearCommBtn" style="flex: 1;">Clear</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="resize-handle" id="resizeHandle"></div>
+    </div>
+
+    <script>
+        // State Management
+        const state = {
+            selectedContext: null,
+            executionMode: 'reload',
+            idleTimer: null,
+            idleThreshold: 20000,
+            onloadDelay: 1000,
+            dragging: false,
+            resizing: false,
+            offsetX: 0,
+            offsetY: 0,
+            user: 'Soulenchanter',
+            date: '2025-12-16',
+            frames: {},
+            connectedFrames: new Set()
         };
 
-        ws.addEventListener('message', function(ev){
-          try {
-            const d = ev.data;
-            let preview = (typeof d === 'string') ? d.slice(0,1000) : `[binary ${d && d.byteLength? d.byteLength : 'N/A'}]`;
-            logLocal('ws_recv', { url, dataPreview: preview, binary: !(typeof d === 'string'), ts: nowIso() });
-            if (typeof d === 'string' && isLikelyStompFrame(d)) {
-              const parsed = parseStompFrame(d);
-              logLocal('stomp_frame', Object.assign({ url, direction: 'recv' }, parsed));
-            }
-          } catch(e){}
-        });
-      }
+        // DOM Elements
+        const overlay = document.getElementById('overlay');
+        const overlayHeader = document.getElementById('overlayHeader');
+        const contextSelect = document.getElementById('contextSelect');
+        const scriptTextarea = document.getElementById('scriptTextarea');
+        const executeBtn = document.getElementById('executeBtn');
+        const reloadInjectBtn = document.getElementById('reloadInjectBtn');
+        const clearBtn = document.getElementById('clearBtn');
+        const minimizeBtn = document.getElementById('minimizeBtn');
+        const closeBtn = document.getElementById('closeBtn');
+        const statusMessage = document.getElementById('statusMessage');
+        const resizeHandle = document.getElementById('resizeHandle');
+        const logEntries = document.getElementById('logEntries');
+        const clearLogBtn = document.getElementById('clearLogBtn');
+        const liveScriptInput = document.getElementById('liveScriptInput');
+        const liveInsertBtn = document.getElementById('liveInsertBtn');
+        const codePreview = document.getElementById('codePreview');
+        const commItems = document.getElementById('commItems');
+        const commStatus = document.getElementById('commStatus');
+        const clearCommBtn = document.getElementById('clearCommBtn');
+        const contextInfo = document.getElementById('contextInfo');
 
-      // attempt to patch any already-open sockets (best-effort)
-      try { const keys = Object.keys(window); for (const k of keys) { try { const v = window[k]; if (v && v instanceof OrigWS) tryPatchInstance(v, v.url || 'unknown'); } catch(e){} } } catch(e){}
-    } catch(e) { console.warn("NI_RAIN WS patch failed", e); }
-  }
-
-  // naive STOMP detection (text frames starting with STOMP commands)
-  function isLikelyStompFrame(txt){
-    if (!txt || typeof txt !== 'string') return false;
-    const head = txt.trim().slice(0,12).toUpperCase();
-    return /^(CONNECT|SEND|MESSAGE|SUBSCRIBE|UNSUBSCRIBE|BEGIN|COMMIT|ABORT|ACK|NACK|DISCONNECT)/.test(head);
-  }
-
-  // simple STOMP frame parser (very permissive)
-  function parseStompFrame(raw){
-    try {
-      // STOMP frame: COMMAND\nheader:val\n...\n\nBODY\0
-      const r = raw;
-      const firstNl = r.indexOf('\n');
-      const command = r.slice(0, firstNl).trim();
-      const rest = r.slice(firstNl+1);
-      const parts = rest.split('\n\n');
-      const headersPart = parts[0] || '';
-      const bodyPart = parts.slice(1).join('\n\n').replace(/\0$/, '');
-      const hdrLines = headersPart.split('\n').filter(Boolean);
-      const headers = {};
-      hdrLines.forEach(line => {
-        const idx = line.indexOf(':');
-        if (idx >= 0) { const k = line.slice(0, idx); const v = line.slice(idx+1); headers[k] = v; }
-      });
-      let parsedBody = bodyPart;
-      try { parsedBody = JSON.parse(bodyPart); } catch(e){}
-      return { command, headers, body: parsedBody, raw };
-    } catch(e){ return { command: 'UNKNOWN', headers: {}, body: raw, raw }; }
-  }
-
-  // enable WS patch now
-  tryPatchWebSocket();
-
-  // also try to detect SockJS send pattern (sockjs wraps messages in arrays/base64) - we hook WS anyway
-
-  // ================== API (start/stop/runOnce/status) ==================
-  async function runOnce(opts = {}) {
-    logLocal('status', { running: true, reason: 'manual-run', ts: nowIso() });
-    const res = await runAttemptOnce(opts);
-    if (!res.success && cfg.wsFallback && cfg.wsUrl && cfg.wsPayload) {
-      try {
-        const wsres = await attemptWsFallback(JSON.stringify(cfg.wsPayload));
-        return wsres;
-      } catch(e){}
-    }
-    return res;
-  }
-
-  async function startLoop(opts = {}) {
-    if (state.running) return;
-    state.running = true;
-    logLocal('status', { running: true, reason: 'startLoop', ts: nowIso() });
-    // immediate run then schedule
-    (async function loop(){
-      try {
-        while (state.running) {
-          state.stats.attempts = state.stats.attempts || 0;
-          state.stats.successes = state.stats.successes || 0;
-          // expose status to overlay (periodic)
-          logLocal('status', { running: true, stats: state.stats, ts: nowIso() });
-          await runOnce(opts);
-          await sleep(opts.intervalMs || cfg.intervalMs || 30000);
+        // Initialize
+        function init() {
+            injectFrameCommunicationScript();
+            discoverContexts();
+            setupEventListeners();
+            setupOverlayControls();
+            setupResizeListener();
+            setupTabs();
+            setupLiveInsert();
+            addLog('System initialized. All frames detected and injected with communication layer.', 'info');
         }
-      } catch(e) {
-        logLocal('status', { running: false, error: String(e), ts: nowIso() });
-        state.running = false;
-      }
-    })();
-  }
 
-  function stopLoop(){
-    state.running = false;
-    logLocal('status', { running: false, reason: 'stopped', ts: nowIso() });
-  }
+        // Inject Communication Script into All Frames
+        function injectFrameCommunicationScript() {
+            const commScript = `
+                window.__SCRIPT_EXECUTOR_USER = '${state.user}';
+                window.__SCRIPT_EXECUTOR_DATE = '${state.date}';
+                window.__FRAME_COMMUNICATION = {
+                    ready: true,
+                    frameId: '${generateFrameId()}',
+                    scripts: [],
+                    pendingResponse: null
+                };
 
-  function status(){
-    return { running: state.running, stats: state.stats, lastResult: state.lastResult };
-  }
+                // Setup message listener
+                window.addEventListener('message', function(event) {
+                    try {
+                        const data = event.data;
+                        
+                        if(data.type === 'INJECT_SCRIPT') {
+                            window.__FRAME_COMMUNICATION.scripts.push({
+                                id: data.id,
+                                script: data.script,
+                                executionMode: data.executionMode,
+                                timestamp: data.timestamp
+                            });
 
-  // attach to window for UI control
-  window.NI_RAIN = {
-    start: (opts) => { startLoop(opts); return status(); },
-    stop: () => { stopLoop(); return status(); },
-    runOnce: (opts) => runOnce(opts),
-    status,
-    cfg,
-    state
-  };
+                            try {
+                                eval(data.script);
+                                window.parent.postMessage({
+                                    type: 'SCRIPT_SUCCESS',
+                                    id: data.id,
+                                    frame: data.frame,
+                                    frameId: window.__FRAME_COMMUNICATION.frameId,
+                                    message: 'Script executed successfully',
+                                    executionMode: data.executionMode,
+                                    user: data.user,
+                                    timestamp: new Date().toISOString()
+                                }, '*');
+                            } catch(err) {
+                                window.parent.postMessage({
+                                    type: 'SCRIPT_ERROR',
+                                    id: data.id,
+                                    frame: data.frame,
+                                    frameId: window.__FRAME_COMMUNICATION.frameId,
+                                    message: err.message,
+                                    stack: err.stack,
+                                    executionMode: data.executionMode,
+                                    timestamp: new Date().toISOString()
+                                }, '*');
+                            }
+                        }
+                        
+                        if(data.type === 'PING') {
+                            window.parent.postMessage({
+                                type: 'PONG',
+                                frame: window.name || 'top',
+                                frameId: window.__FRAME_COMMUNICATION.frameId,
+                                url: window.location.href,
+                                timestamp: new Date().toISOString()
+                            }, '*');
+                        }
+                    } catch(e) {
+                        console.error('[Frame Communication Error]', e);
+                    }
+                });
 
-  // ================== ON LOAD BEHAVIOR ==================
-  // post an initial ready message with hooks detected
-  (function announce(){
-    logLocal('ready', { ts: nowIso(), msg: 'NI_RAIN ready', canPatchWS: !!window.WebSocket });
-  })();
+                // Signal ready
+                window.parent.postMessage({
+                    type: 'FRAME_READY',
+                    frame: window.name || 'top',
+                    frameId: window.__FRAME_COMMUNICATION.frameId,
+                    url: window.location.href,
+                    timestamp: new Date().toISOString()
+                }, '*');
+            `;
 
-  // run auto-patch for WebSocket if not yet patched
-  tryPatchWebSocket();
+            // Inject into all current iframes
+            document.querySelectorAll('iframe').forEach(iframe => {
+                try {
+                    if(iframe.contentWindow) {
+                        iframe.contentWindow.eval(commScript);
+                    }
+                } catch(e) {
+                    console.warn('Could not inject into iframe:', iframe.name || iframe.id, e);
+                }
+            });
 
-  // auto-start if configured
-  if (cfg.autostart) {
-    setTimeout(()=>{ window.NI_RAIN.start(); }, 400);
-  }
+            // Monitor for new iframes
+            const observer = new MutationObserver((mutations) => {
+                mutations.forEach((mutation) => {
+                    mutation.addedNodes.forEach((node) => {
+                        if(node.tagName === 'IFRAME') {
+                            setTimeout(() => {
+                                try {
+                                    if(node.contentWindow) {
+                                        node.contentWindow.eval(commScript);
+                                    }
+                                } catch(e) {
+                                    console.warn('Could not inject into new iframe:', node.name, e);
+                                }
+                            }, 100);
+                        }
+                    });
+                });
+            });
 
-  // ================== for debugging: expose helper to merge with overlay logs ==================
-  // overlay can call window.postMessage({ ni:true, source:'overlay', type:'merge_request', payload:{ lastLogId: '...' }}, '*')
-  window.addEventListener('message', (e) => {
-    const m = e.data;
-    if (!m || m.ni !== true) return;
-    if (m.source === 'overlay' && m.type === 'ping') {
-      logLocal('pong', { ts: nowIso(), info: 'pong from rain' });
-    }
-  });
+            observer.observe(document.documentElement, {
+                childList: true,
+                subtree: true
+            });
+        }
 
-})(); // end NI_Rain_Global wrapper
+        // Generate Unique Frame ID
+        function generateFrameId() {
+            return 'frame_' + Math.random().toString(36).substr(2, 9);
+        }
+
+        // Discover Available Contexts/Frames
+        function discoverContexts() {
+            const contexts = [];
+
+            contexts.push({
+                name: 'top',
+                label: '🌐 Top Window',
+                window: window,
+                url: window.location.href,
+                accessible: true
+            });
+
+            const frames = document.querySelectorAll('iframe');
+            frames.forEach((iframe, index) => {
+                const frameName = iframe.name || iframe.id || `Frame ${index + 1}`;
+                let accessible = false;
+                let url = 'N/A';
+
+                try {
+                    if(iframe.contentWindow && iframe.contentWindow.location) {
+                        url = iframe.contentWindow.location.href;
+                        accessible = true;
+                    }
+                } catch(e) {
+                    // Cross-origin iframe
+                }
+
+                state.frames[frameName] = {
+                    element: iframe,
+                    accessible: accessible,
+                    url: url
+                };
+
+                contexts.push({
+                    name: frameName,
+                    label: `📦 ${frameName}`,
+                    window: null,
+                    url: url,
+                    accessible: accessible
+                });
+            });
+
+            contexts.forEach(context => {
+                const option = document.createElement('option');
+                option.value = context.name;
+                option.textContent = context.label;
+                option.dataset.url = context.url;
+                option.dataset.accessible = context.accessible;
+                contextSelect.appendChild(option);
+            });
+
+            addLog(`Discovered ${frames.length} iframe(s) + top window = ${contexts.length} total contexts`, 'info');
+        }
+
+        // Setup Event Listeners
+        function setupEventListeners() {
+            contextSelect.addEventListener('change', (e) => {
+                state.selectedContext = e.target.value;
+                
+                if(state.selectedContext === 'top') {
+                    contextInfo.style.display = 'none';
+                } else {
+                    updateContextInfo();
+                    contextInfo.style.display = 'grid';
+                }
+
+                resetIdleTimer();
+                showStatus(`Context: ${state.selectedContext || 'None'}`, 'info');
+            });
+
+            document.querySelectorAll('input[name="executionMode"]').forEach(radio => {
+                radio.addEventListener('change', (e) => {
+                    state.executionMode = e.target.value;
+                    resetIdleTimer();
+                    addLog(`Execution mode: ${state.executionMode}`, 'info');
+                });
+            });
+
+            executeBtn.addEventListener('click', executeScript);
+            reloadInjectBtn.addEventListener('click', executeWithReload);
+            clearBtn.addEventListener('click', () => {
+                scriptTextarea.value = '';
+                showStatus('Script cleared', 'info');
+            });
+
+            clearLogBtn.addEventListener('click', () => {
+                logEntries.innerHTML = '';
+                addLog('Log cleared by user', 'info');
+            });
+
+            clearCommBtn.addEventListener('click', () => {
+                commItems.innerHTML = '';
+                addLog('Communication log cleared', 'info');
+            });
+
+            document.addEventListener('mousemove', resetIdleTimer);
+            document.addEventListener('keypress', resetIdleTimer);
+        }
+
+        // Update Context Info
+        function updateContextInfo() {
+            const frameName = state.selectedContext;
+            const frameData = state.frames[frameName];
+
+            if(frameData) {
+                document.getElementById('infoFrameName').textContent = frameName;
+                document.getElementById('infoFrameUrl').textContent = frameData.url;
+                document.getElementById('infoAccessible').textContent = frameData.accessible ? '✓ Yes' : '✗ No (Cross-origin)';
+                document.getElementById('infoConnection').textContent = state.connectedFrames.has(frameName) ? '🟢 Connected' : '🔴 Pending';
+            }
+        }
+
+        // Setup Tabs
+        function setupTabs() {
+            document.querySelectorAll('.tab-btn').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    const tabName = btn.dataset.tab;
+                    
+                    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+                    document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+                    
+                    btn.classList.add('active');
+                    document.getElementById(tabName + '-tab').classList.add('active');
+                });
+            });
+        }
+
+        // Setup Live Insert
+        function setupLiveInsert() {
+            const snippets = document.querySelectorAll('.quick-snippet-btn');
+            snippets.forEach(btn => {
+                btn.addEventListener('click', () => {
+                    const snippet = btn.dataset.snippet;
+                    liveScriptInput.value = snippet;
+                    codePreview.textContent = snippet;
+                    
+                    snippets.forEach(b => b.classList.remove('active'));
+                    btn.classList.add('active');
+                });
+            });
+
+            liveScriptInput.addEventListener('input', (e) => {
+                codePreview.textContent = e.target.value || '// Code preview will appear here...';
+            });
+
+            liveInsertBtn.addEventListener('click', () => {
+                const script = liveScriptInput.value.trim();
+                if (!script) {
+                    showStatus('Script cannot be empty', 'error');
+                    return;
+                }
+
+                if (!state.selectedContext) {
+                    showStatus('Please select a context first', 'error');
+                    return;
+                }
+
+                executeLiveScript(script);
+            });
+        }
+
+        // Execute Script
+        async function executeScript() {
+            if (!state.selectedContext) {
+                showStatus('Please select a context first', 'error');
+                return;
+            }
+
+            const script = scriptTextarea.value.trim();
+            if (!script) {
+                showStatus('Script cannot be empty', 'error');
+                return;
+            }
+
+            executeInContext(script, false);
+        }
+
+        // Execute with Reload and Inject
+        async function executeWithReload() {
+            if (!state.selectedContext) {
+                showStatus('Please select a context first', 'error');
+                return;
+            }
+
+            const script = scriptTextarea.value.trim();
+            if (!script) {
+                showStatus('Script cannot be empty', 'error');
+                return;
+            }
+
+            if (state.selectedContext === 'top') {
+                showStatus('Cannot reload top window. Use Execute instead.', 'error');
+                return;
+            }
+
+            const iframe = state.frames[state.selectedContext]?.element;
+            if (!iframe) {
+                showStatus(`Frame "${state.selectedContext}" not found`, 'error');
+                return;
+            }
+
+            showStatus('Reloading iframe and injecting script...', 'info');
+            addLog(`Reloading iframe "${state.selectedContext}"...`, 'warning');
+
+            const srcDoc = iframe.getAttribute('srcdoc');
+            const src = iframe.getAttribute('src');
+
+            iframe.onload = () => {
+                addLog(`Frame "${state.selectedContext}" reloaded, injecting script...`, 'info');
+                setTimeout(() => {
+                    executeInIframe(iframe, script, false);
+                }, state.onloadDelay);
+            };
+
+            if (srcDoc) {
+                iframe.setAttribute('srcdoc', srcDoc);
+            } else if (src) {
+                iframe.src = src;
+            } else {
+                showStatus('Cannot reload: no src or srcdoc found', 'error');
+            }
+        }
+
+        // Execute in Context
+        function executeInContext(script, live = false) {
+            try {
+                if (state.selectedContext === 'top') {
+                    eval(script);
+                    showStatus('✓ Script executed in top window', 'success');
+                    addLog(`Script executed in top window by ${state.user}`, 'success');
+                } else {
+                    const iframe = state.frames[state.selectedContext]?.element;
+                    if (iframe) {
+                        executeInIframe(iframe, script, live);
+                    }
+                }
+            } catch (error) {
+                showStatus(`Error: ${error.message}`, 'error');
+                addLog(`Execution error: ${error.message}`, 'error');
+            }
+        }
+
+        // Execute Script in iframe
+        function executeInIframe(iframe, script, live = false) {
+            try {
+                const scriptId = 'script_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+                iframe.contentWindow.postMessage({
+                    type: 'INJECT_SCRIPT',
+                    id: scriptId,
+                    script: script,
+                    frame: state.selectedContext,
+                    executionMode: state.executionMode,
+                    live: live,
+                    user: state.user,
+                    timestamp: new Date().toISOString()
+                }, '*');
+
+                showStatus(`✓ Script injected into ${state.selectedContext}`, 'success');
+                addLog(`Script injected into ${state.selectedContext} [${scriptId.substr(0, 12)}...]`, 'info');
+            } catch (error) {
+                showStatus(`Injection error: ${error.message}`, 'error');
+                addLog(`Injection error: ${error.message}`, 'error');
+            }
+        }
+
+        // Execute Live Script
+        function executeLiveScript(script) {
+            try {
+                if (state.selectedContext === 'top') {
+                    eval(script);
+                    showStatus('✓ Live script executed in top window', 'success');
+                    addLog(`Live script executed in top window by ${state.user}`, 'success');
+                } else {
+                    const iframe = state.frames[state.selectedContext]?.element;
+                    if (iframe) {
+                        executeInIframe(iframe, script, true);
+                    }
+                }
+            } catch (error) {
+                showStatus(`✗ Error: ${error.message}`, 'error');
+                addLog(`Live script error: ${error.message}`, 'error');
+            }
+        }
+
+        // Listen for messages from iframes
+        window.addEventListener('message', (event) => {
+            const data = event.data;
+
+            if (data.type === 'FRAME_READY') {
+                state.connectedFrames.add(data.frame);
+                addLog(`🟢 Frame ready: "${data.frame}" [${data.frameId}] | URL: ${data.url}`, 'success');
+                updateCommStatus();
+                addComm(`RECEIVED: Frame Ready from "${data.frame}"`, 'received');
+                updateContextInfo();
+            }
+
+            if (data.type === 'SCRIPT_SUCCESS') {
+                showStatus(`✓ ${data.frame}: Success`, 'success');
+                addLog(`[${data.frame}] ✓ ${data.message} (${data.executionMode})`, 'success');
+                addComm(`RECEIVED: Success from "${data.frame}" [${data.id?.substr(0, 12)}...]`, 'received');
+            }
+
+            if (data.type === 'SCRIPT_ERROR') {
+                showStatus(`✗ ${data.frame}: ${data.message}`, 'error');
+                addLog(`[${data.frame}] ✗ Error: ${data.message}`, 'error');
+                addComm(`RECEIVED: Error from "${data.frame}": ${data.message}`, 'received');
+            }
+
+            if (data.type === 'PONG') {
+                addComm(`RECEIVED: Pong from "${data.frame}"`, 'received');
+            }
+        });
+
+        // Setup Overlay Controls
+        function setupOverlayControls() {
+            overlayHeader.addEventListener('mousedown', (e) => {
+                if (e.target.tagName === 'BUTTON') return;
+                state.dragging = true;
+                state.offsetX = e.clientX - overlay.offsetLeft;
+                state.offsetY = e.clientY - overlay.offsetTop;
+            });
+
+            document.addEventListener('mousemove', (e) => {
+                if (state.dragging && !overlay.classList.contains('minimized')) {
+                    overlay.style.left = (e.clientX - state.offsetX) + 'px';
+                    overlay.style.top = (e.clientY - state.offsetY) + 'px';
+                    overlay.style.right = 'auto';
+                    overlay.style.bottom = 'auto';
+                }
+            });
+
+            document.addEventListener('mouseup', () => {
+                state.dragging = false;
+            });
+
+            minimizeBtn.addEventListener('click', () => {
+                overlay.classList.toggle('minimized');
+                minimizeBtn.textContent = overlay.classList.contains('minimized') ? '+' : '−';
+            });
+
+            closeBtn.addEventListener('click', () => {
+                overlay.style.display = 'none';
+            });
+
+            overlay.addEventListener('click', (e) => {
+                if (overlay.classList.contains('minimized') && e.target === overlay) {
+                    overlay.classList.remove('minimized');
+                    minimizeBtn.textContent = '−';
+                }
+            });
+        }
+
+        // Setup Resize Listener
+        function setupResizeListener() {
+            resizeHandle.addEventListener('mousedown', (e) => {
+                state.resizing = true;
+                const startX = e.clientX;
+                const startY = e.clientY;
+                const startWidth = overlay.offsetWidth;
+                const startHeight = overlay.offsetHeight;
+
+                const handleMouseMove = (moveEvent) => {
+                    if (state.resizing) {
+                        const newWidth = Math.max(400, startWidth + (moveEvent.clientX - startX));
+                        const newHeight = Math.max(300, startHeight + (moveEvent.clientY - startY));
+                        overlay.style.width = newWidth + 'px';
+                        overlay.style.height = newHeight + 'px';
+                    }
+                };
+
+                const handleMouseUp = () => {
+                    state.resizing = false;
+                    document.removeEventListener('mousemove', handleMouseMove);
+                    document.removeEventListener('mouseup', handleMouseUp);
+                };
+
+                document.addEventListener('mousemove', handleMouseMove);
+                document.addEventListener('mouseup', handleMouseUp);
+            });
+        }
+
+        // Idle Timer
+        function resetIdleTimer() {
+            clearTimeout(state.idleTimer);
+        }
+
+        // Show Status Message
+        function showStatus(message, type) {
+            statusMessage.textContent = message;
+            statusMessage.className = `status-message show ${type}`;
+            setTimeout(() => {
+                statusMessage.classList.remove('show');
+            }, 4000);
+        }
+
+        // Add Log Entry
+        function addLog(message, type = 'info') {
+            const entry = document.createElement('div');
+            entry.className = `log-entry ${type}`;
+            const time = new Date().toLocaleTimeString();
+            entry.innerHTML = `<span class="log-timestamp">[${time}]</span> ${message}`;
+            logEntries.appendChild(entry);
+            logEntries.scrollTop = logEntries.scrollHeight;
+        }
+
+        // Add Communication Entry
+        function addComm(message, direction = 'sent') {
+            const entry = document.createElement('div');
+            entry.className = `comm-item ${direction}`;
+            const time = new Date().toLocaleTimeString();
+            const dir = direction === 'sent' ? '📤 SENT' : '📥 RECEIVED';
+            entry.innerHTML = `<span class="log-timestamp">[${time}]</span> <span class="comm-direction">${dir}:</span> ${message}`;
+            commItems.appendChild(entry);
+            commItems.scrollTop = commItems.scrollHeight;
+        }
+
+        // Update Communication Status
+        function updateCommStatus() {
+            const connected = state.connectedFrames.size;
+            if (connected > 0) {
+                commStatus.innerHTML = `🟢 Connected to ${connected} frame(s)`;
+                commStatus.className = 'comm-status connected';
+            } else {
+                commStatus.innerHTML = `🔴 No connections active`;
+                commStatus.className = 'comm-status';
+            }
+        }
+
+        // Initialize on page load
+        window.addEventListener('load', init);
+    </script>
+</body>
+</html>
