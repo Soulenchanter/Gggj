@@ -1,0 +1,1177 @@
+// ==UserScript==
+// @name         Rain Claim Interceptor Complete
+// @namespace    https://example.local/rain
+// @version      2.0.0
+// @description  Complete Rain claim automation with overlay, WS/STOMP interception, auth, retries, and clone-based payload mutation.
+// @match        *://*/*
+// @grant        none
+// @run-at       document-start
+// ==/UserScript==
+
+(() => {
+  "use strict";
+
+  if (window.__RAIN_CLAIM_INTERCEPTOR_LOADED__) return;
+  window.__RAIN_CLAIM_INTERCEPTOR_LOADED__ = true;
+
+  /**************************************************************************
+   * Configuration & Storage Keys
+   **************************************************************************/
+  const RAIN_STORAGE = {
+    CONFIG: "rain_config_v2",
+    CLONES: "rain_clones_v2",
+    LOGS: "rain_logs_v2",
+    AUTH: "rain_auth_v2",
+    STATS: "rain_stats_v2"
+  };
+
+  const RAIN_DEFAULTS = {
+    claimEndpoint: "",
+    method: "POST",
+    intervalMs: 30000,
+    maxRetries: 3,
+    baseDelayMs: 800,
+    timeoutMs: 12000,
+    preferFetch: true,
+    followRedirect: true,
+    expectJsonResponse: true,
+    wsFallback: false,
+    wsUrl: null,
+    wsPayload: null,
+    stompEnabled: false,
+    stompEndpoint: null,
+    autoStartOnLoad: false,
+    headers: { "Content-Type": "application/json" }
+  };
+
+  /**************************************************************************
+   * Utility Functions
+   **************************************************************************/
+  function safeJSONParse(s) { 
+    try { return JSON.parse(s); } 
+    catch (e) { return null; } 
+  }
+
+  function uid() { 
+    return Math.random().toString(36).slice(2, 9); 
+  }
+
+  function nowIso() { 
+    return new Date().toISOString(); 
+  }
+
+  function safeClone(obj) {
+    if (obj === null || typeof obj !== "object") return obj;
+    if (obj instanceof Date) return new Date(obj);
+    if (Array.isArray(obj)) return obj.map(safeClone);
+    const out = {};
+    for (const k in obj) {
+      try { out[k] = safeClone(obj[k]); } 
+      catch (e) { out[k] = String(obj[k]); }
+    }
+    return out;
+  }
+
+  function loadJSON(key, fallback) {
+    try { 
+      const raw = localStorage.getItem(key); 
+      return raw ? JSON.parse(raw) : fallback; 
+    } 
+    catch (e) { return fallback; }
+  }
+
+  function saveJSON(key, value) {
+    try { 
+      localStorage.setItem(key, JSON.stringify(value)); 
+    } 
+    catch (e) { 
+      console.warn("saveJSON fail", e); 
+    }
+  }
+
+  /**************************************************************************
+   * Initialize Storage & State
+   **************************************************************************/
+  let RAIN_CONFIG = loadJSON(RAIN_STORAGE.CONFIG, RAIN_DEFAULTS);
+  let RAIN_CLONES = loadJSON(RAIN_STORAGE.CLONES, []);
+  let RAIN_LOGS = loadJSON(RAIN_STORAGE.LOGS, []);
+  let RAIN_AUTH = loadJSON(RAIN_STORAGE.AUTH, {
+    bearerToken: "",
+    customHeaders: {},
+    sessionId: null,
+    cookies: null
+  });
+  let RAIN_STATS = loadJSON(RAIN_STORAGE.STATS, {
+    attempts: 0,
+    successes: 0,
+    failures: 0,
+    lastAttempt: null,
+    lastSuccess: null
+  });
+
+  function persistConfig() { saveJSON(RAIN_STORAGE.CONFIG, RAIN_CONFIG); }
+  function persistClones() { saveJSON(RAIN_STORAGE.CLONES, RAIN_CLONES); }
+  function persistLogs() { saveJSON(RAIN_STORAGE.LOGS, RAIN_LOGS.slice(-1000)); }
+  function persistAuth() { saveJSON(RAIN_STORAGE.AUTH, RAIN_AUTH); }
+  function persistStats() { saveJSON(RAIN_STORAGE.STATS, RAIN_STATS); }
+
+  /**************************************************************************
+   * UI Styles - Complete
+   **************************************************************************/
+  const styleStr = `
+    .rain-overlay { 
+      position: fixed; right: 12px; top: 12px; width: 420px; max-height: 85vh; 
+      background: #0a0e0a; color: #ffeb3b; font-family: 'Courier New', monospace; 
+      z-index: 2147483646; border: 2px solid #ffeb3b; border-radius: 8px; 
+      box-shadow: 0 8px 32px rgba(0,0,0,0.9); display: flex; flex-direction: column; 
+      overflow: hidden; 
+    }
+    .rain-header { 
+      background: #1a1410; padding: 10px 12px; display: flex; align-items: center; 
+      gap: 8px; cursor: grab; user-select: none; border-bottom: 1px solid #ffeb3b; 
+    }
+    .rain-title { flex: 1; font-weight: 700; color: #ffeb3b; font-size: 14px; }
+    .rain-tabs { 
+      display: flex; gap: 4px; padding: 6px; background: #050404; 
+      border-bottom: 1px solid #3a3a1a; overflow-x: auto; 
+    }
+    .rain-tabs button { 
+      background: #0a0e0a; color: #999; border: 1px solid #3a3a2a; 
+      padding: 6px 10px; border-radius: 3px; cursor: pointer; font-size: 11px; 
+      transition: all 0.3s;
+    }
+    .rain-tabs button:hover { background: #1a1a0a; border-color: #ffeb3b; }
+    .rain-tabs button.active { background: #ffeb3b; color: #000; font-weight: 600; }
+    .rain-content { flex: 1; padding: 10px; overflow-y: auto; font-size: 11px; }
+    .rain-btn { 
+      background: #4d4400; color: #ffeb3b; border: 1px solid #ffeb3b; 
+      padding: 6px 10px; border-radius: 4px; cursor: pointer; font-size: 11px; 
+      transition: all 0.3s; font-weight: 600;
+    }
+    .rain-btn:hover { background: #ffeb3b; color: #000; }
+    .rain-btn:active { transform: scale(0.98); }
+    .rain-btn-start { background: #1a4d1a; border-color: #4caf50; color: #4caf50; }
+    .rain-btn-start:hover { background: #4caf50; color: #000; }
+    .rain-btn-stop { background: #4d1a1a; border-color: #ff4444; color: #ff4444; }
+    .rain-btn-stop:hover { background: #ff4444; color: #000; }
+    .rain-pre { 
+      background: #030504; padding: 6px; border-radius: 3px; white-space: pre-wrap; 
+      font-size: 10px; border-left: 3px solid #ffeb3b; color: #fff; 
+      margin-bottom: 4px; overflow-x: auto; word-break: break-all;
+    }
+    .rain-stat { 
+      display: flex; justify-content: space-between; padding: 4px 0; 
+      font-size: 11px; border-bottom: 1px solid #2a2a1a; padding-bottom: 4px; 
+      margin-bottom: 4px;
+    }
+    .rain-input, .rain-textarea, .rain-select { 
+      background: #0f140f; color: #ffeb3b; border: 1px solid #3a3a2a; 
+      padding: 4px 6px; border-radius: 3px; font-family: monospace; font-size: 11px; 
+      transition: all 0.3s;
+    }
+    .rain-input:focus, .rain-textarea:focus, .rain-select:focus { 
+      border-color: #ffeb3b; outline: none; box-shadow: 0 0 4px rgba(255, 235, 59, 0.3);
+    }
+    .rain-label { 
+      display: block; margin: 6px 0 2px 0; font-weight: 600; color: #ffeb3b; 
+      font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px;
+    }
+    .rain-modal { 
+      position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); 
+      background: #0a0e0a; color: #ffeb3b; padding: 16px; border: 2px solid #ffeb3b; 
+      border-radius: 6px; z-index: 2147483650; max-height: 80vh; overflow-y: auto; 
+      min-width: 350px; max-width: 700px; box-shadow: 0 8px 32px rgba(0,0,0,0.95);
+    }
+    .rain-modal h3 { margin-top: 0; margin-bottom: 12px; color: #ffeb3b; }
+    .rain-row { display: flex; gap: 6px; margin-bottom: 8px; }
+    .rain-row-full { width: 100%; }
+    @media (max-width: 768px) {
+      .rain-overlay { width: 95vw; top: auto; bottom: 12px; right: auto; left: 2.5vw; }
+      .rain-modal { min-width: 90vw; }
+    }
+  `;
+
+  const style = document.createElement("style");
+  style.textContent = styleStr;
+  document.documentElement.appendChild(style);
+
+  /**************************************************************************
+   * Overlay DOM Creation
+   **************************************************************************/
+  const overlay = document.createElement("div");
+  overlay.className = "rain-overlay";
+  overlay.setAttribute("data-rain-overlay", "1");
+
+  const header = document.createElement("div");
+  header.className = "rain-header";
+  header.innerHTML = `
+    <div class="rain-title">⛅ Rain Claim v2.0 [${new Date().toISOString().split('T')[0]}]</div>
+    <div style="display: flex; gap: 4px;">
+      <button id="rain-minimize" class="rain-btn" title="Minimize">−</button>
+      <button id="rain-close" class="rain-btn" title="Close">✕</button>
+    </div>
+  `;
+  overlay.appendChild(header);
+
+  const tabs = document.createElement("div");
+  tabs.className = "rain-tabs";
+  const tabNames = ["Status", "Config", "Clones", "Auth", "Logs"];
+  const tabButtons = {};
+  
+  tabNames.forEach(name => {
+    const b = document.createElement("button");
+    b.textContent = name;
+    b.className = name === "Status" ? "active" : "";
+    b.onclick = () => setRainTab(name);
+    b.title = `Switch to ${name}`;
+    tabs.appendChild(b);
+    tabButtons[name] = b;
+  });
+  overlay.appendChild(tabs);
+
+  const content = document.createElement("div");
+  content.className = "rain-content";
+  overlay.appendChild(content);
+
+  document.body.appendChild(overlay);
+
+  /**************************************************************************
+   * Draggable Functionality
+   **************************************************************************/
+  (function initDrag() {
+    let dragging = false, offsetX = 0, offsetY = 0;
+    
+    header.addEventListener("mousedown", e => {
+      if (e.target.closest("button")) return;
+      dragging = true;
+      offsetX = e.clientX - overlay.offsetLeft;
+      offsetY = e.clientY - overlay.offsetTop;
+      header.style.cursor = "grabbing";
+    });
+
+    window.addEventListener("mouseup", () => {
+      dragging = false;
+      header.style.cursor = "grab";
+    });
+
+    window.addEventListener("mousemove", e => {
+      if (dragging) {
+        overlay.style.left = (e.clientX - offsetX) + "px";
+        overlay.style.top = (e.clientY - offsetY) + "px";
+        overlay.style.right = "auto";
+        overlay.style.bottom = "auto";
+      }
+    });
+
+    document.getElementById("rain-minimize").onclick = () => {
+      overlay.style.display = "none";
+      createRainFloatingButton();
+    };
+
+    document.getElementById("rain-close").onclick = () => {
+      overlay.remove();
+      createRainFloatingButton();
+    };
+  })();
+
+  /**************************************************************************
+   * Floating Button
+   **************************************************************************/
+  function createRainFloatingButton() {
+    if (document.querySelector("[data-rain-btn]")) return;
+    const btn = document.createElement("button");
+    btn.setAttribute("data-rain-btn", "1");
+    btn.style.cssText = `
+      position: fixed;
+      bottom: 60px;
+      right: 20px;
+      z-index: 2147483647;
+      background: #4d4400;
+      color: #ffeb3b;
+      border: 2px solid #ffeb3b;
+      padding: 10px 14px;
+      border-radius: 4px;
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.6);
+      transition: all 0.3s;
+    `;
+    btn.textContent = "⛅ Rain";
+    btn.onmouseover = () => btn.style.background = "#ffeb3b";
+    btn.onmouseout = () => btn.style.background = "#4d4400";
+    btn.onclick = () => {
+      if (!document.querySelector("[data-rain-overlay]")) document.body.appendChild(overlay);
+      overlay.style.display = "flex";
+      btn.remove();
+    };
+    document.body.appendChild(btn);
+  }
+
+  /**************************************************************************
+   * Modal
+   **************************************************************************/
+  const modal = document.createElement("div");
+  modal.className = "rain-modal";
+  modal.style.display = "none";
+  document.body.appendChild(modal);
+
+  function showRainModal(dom) {
+    modal.innerHTML = "";
+    modal.style.display = "block";
+    modal.appendChild(dom);
+    modal.scrollTop = 0;
+  }
+
+  function hideRainModal() {
+    modal.style.display = "none";
+    modal.innerHTML = "";
+  }
+
+  /**************************************************************************
+   * Log System
+   **************************************************************************/
+  function pushRainLog(line, type = "log", meta = {}) {
+    const entry = { ts: nowIso(), line, type, meta };
+    RAIN_LOGS.push(entry);
+    if (RAIN_LOGS.length > 1000) RAIN_LOGS.shift();
+    persistLogs();
+    if (currentRainTab === "Logs") renderRainLogs();
+    
+    // Also broadcast to console
+    const icon = type === "error" ? "❌" : type === "warn" ? "⚠️" : type === "log" ? "ℹ️" : "✓";
+    console.log(`[Rain ${type.toUpperCase()}] ${icon} ${line}`, meta);
+  }
+
+  /**************************************************************************
+   * Tab Management
+   **************************************************************************/
+  let currentRainTab = "Status";
+
+  function setRainTab(name) {
+    currentRainTab = name;
+    content.innerHTML = "";
+    Object.keys(tabButtons).forEach(k => {
+      tabButtons[k].classList.remove("active");
+      if (k === name) tabButtons[k].classList.add("active");
+    });
+    
+    switch(name) {
+      case "Status": renderRainStatus(); break;
+      case "Config": renderRainConfig(); break;
+      case "Clones": renderRainClones(); break;
+      case "Auth": renderRainAuth(); break;
+      case "Logs": renderRainLogs(); break;
+    }
+  }
+
+  /**************************************************************************
+   * Status Tab Renderer
+   **************************************************************************/
+  function renderRainStatus() {
+    const successRate = RAIN_STATS.attempts > 0 ? ((RAIN_STATS.successes / RAIN_STATS.attempts) * 100).toFixed(1) : 0;
+    const lastAttemptTime = RAIN_STATS.lastAttempt ? new Date(RAIN_STATS.lastAttempt).toLocaleTimeString() : "Never";
+    const lastSuccessTime = RAIN_STATS.lastSuccess ? new Date(RAIN_STATS.lastSuccess).toLocaleTimeString() : "Never";
+    const isRunning = rainEngine.getState().running;
+
+    const html = `
+      <div style="margin-bottom: 12px;">
+        <div style="color: #ffeb3b; font-weight: 700; margin-bottom: 8px; font-size: 12px;">📊 STATISTICS</div>
+        <div class="rain-stat">
+          <span>Attempts:</span> 
+          <strong style="color: #fff;">${RAIN_STATS.attempts}</strong>
+        </div>
+        <div class="rain-stat">
+          <span>✓ Successes:</span> 
+          <strong style="color: #4caf50;">${RAIN_STATS.successes}</strong>
+        </div>
+        <div class="rain-stat">
+          <span>✗ Failures:</span> 
+          <strong style="color: #ff4444;">${RAIN_STATS.failures}</strong>
+        </div>
+        <div class="rain-stat">
+          <span>Success Rate:</span> 
+          <strong style="color: ${successRate >= 50 ? '#4caf50' : '#ff9800'};">${successRate}%</strong>
+        </div>
+        <div class="rain-stat">
+          <span>Last Attempt:</span> 
+          <small style="color: #aaa;">${lastAttemptTime}</small>
+        </div>
+        <div class="rain-stat" style="border-bottom: none;">
+          <span>Last Success:</span> 
+          <small style="color: #4caf50;">${lastSuccessTime}</small>
+        </div>
+      </div>
+
+      <div style="margin-bottom: 12px;">
+        <div style="color: #ffeb3b; font-weight: 700; margin-bottom: 8px; font-size: 12px;">🎯 CONTROL</div>
+        <div style="display: flex; gap: 4px; margin-bottom: 8px;">
+          <button id="rain-start-btn" class="rain-btn rain-btn-start" style="flex: 1;">▶ Start</button>
+          <button id="rain-stop-btn" class="rain-btn rain-btn-stop" style="flex: 1;">⏹ Stop</button>
+        </div>
+        <button id="rain-claim-once" class="rain-btn" style="width: 100%; margin-bottom: 8px;">🎯 Claim Once</button>
+        <div style="background: #1a1410; padding: 6px; border-radius: 4px; text-align: center; font-size: 10px; color: #888;">
+          Status: <span style="color: ${isRunning ? '#4caf50' : '#ff9800'}; font-weight: 600;">${isRunning ? '🟢 RUNNING' : '🟡 IDLE'}</span>
+        </div>
+      </div>
+
+      <div style="background: #1a1410; padding: 8px; border-radius: 4px; border: 1px solid #3a3a2a;">
+        <div style="color: #ffeb3b; font-weight: 600; margin-bottom: 6px; font-size: 11px;">⚙️ QUICK CONFIG</div>
+        <label class="rain-label">Endpoint:</label>
+        <input id="rain-endpoint-quick" class="rain-input rain-row-full" value="${RAIN_CONFIG.claimEndpoint || ''}" placeholder="https://..." />
+        
+        <label class="rain-label" style="margin-top: 8px;">Interval (sec):</label>
+        <input id="rain-interval-quick" class="rain-input rain-row-full" type="number" value="${RAIN_CONFIG.intervalMs / 1000}" min="1" max="3600" />
+      </div>
+    `;
+
+    content.innerHTML = html;
+
+    document.getElementById("rain-start-btn").onclick = () => {
+      updateQuickConfig();
+      rainEngine.startLoop();
+      pushRainLog("🔄 Loop started", "log");
+      renderRainStatus();
+    };
+
+    document.getElementById("rain-stop-btn").onclick = () => {
+      rainEngine.stopLoop();
+      pushRainLog("⏹ Loop stopped", "warn");
+      renderRainStatus();
+    };
+
+    document.getElementById("rain-claim-once").onclick = async () => {
+      updateQuickConfig();
+      const result = await rainEngine.runOnce();
+      pushRainLog(`Claim: ${result.success ? '✓ Success' : '✗ Failed'}`, result.success ? "log" : "error", result);
+      renderRainStatus();
+    };
+
+    function updateQuickConfig() {
+      const endpoint = document.getElementById("rain-endpoint-quick").value;
+      const interval = parseInt(document.getElementById("rain-interval-quick").value) || 30;
+      RAIN_CONFIG.claimEndpoint = endpoint;
+      RAIN_CONFIG.intervalMs = interval * 1000;
+      persistConfig();
+    }
+  }
+
+  /**************************************************************************
+   * Config Tab Renderer
+   **************************************************************************/
+  function renderRainConfig() {
+    const html = `
+      <div style="display: flex; flex-direction: column; gap: 8px;">
+        <div>
+          <label class="rain-label">Claim Endpoint:</label>
+          <input id="rc-endpoint" class="rain-input rain-row-full" value="${RAIN_CONFIG.claimEndpoint || ''}" />
+        </div>
+
+        <div>
+          <label class="rain-label">HTTP Method:</label>
+          <select id="rc-method" class="rain-select rain-row-full">
+            <option value="POST" ${RAIN_CONFIG.method === 'POST' ? 'selected' : ''}>POST</option>
+            <option value="GET" ${RAIN_CONFIG.method === 'GET' ? 'selected' : ''}>GET</option>
+            <option value="PUT" ${RAIN_CONFIG.method === 'PUT' ? 'selected' : ''}>PUT</option>
+            <option value="PATCH" ${RAIN_CONFIG.method === 'PATCH' ? 'selected' : ''}>PATCH</option>
+          </select>
+        </div>
+
+        <div>
+          <label class="rain-label">Interval (ms):</label>
+          <input id="rc-interval" class="rain-input rain-row-full" type="number" value="${RAIN_CONFIG.intervalMs}" />
+        </div>
+
+        <div class="rain-row">
+          <div style="flex: 1;">
+            <label class="rain-label">Max Retries:</label>
+            <input id="rc-retries" class="rain-input rain-row-full" type="number" value="${RAIN_CONFIG.maxRetries}" />
+          </div>
+          <div style="flex: 1;">
+            <label class="rain-label">Base Delay (ms):</label>
+            <input id="rc-delay" class="rain-input rain-row-full" type="number" value="${RAIN_CONFIG.baseDelayMs}" />
+          </div>
+        </div>
+
+        <div>
+          <label class="rain-label">Timeout (ms):</label>
+          <input id="rc-timeout" class="rain-input rain-row-full" type="number" value="${RAIN_CONFIG.timeoutMs}" />
+        </div>
+
+        <div style="background: #1a1410; padding: 8px; border-radius: 4px; border: 1px solid #3a3a2a;">
+          <label style="display: flex; align-items: center; margin-bottom: 6px; cursor: pointer;">
+            <input type="checkbox" ${RAIN_CONFIG.preferFetch ? 'checked' : ''} id="rc-fetch" style="margin-right: 6px;" /> 
+            <span style="font-size: 11px;">Prefer Fetch over XHR</span>
+          </label>
+          <label style="display: flex; align-items: center; margin-bottom: 6px; cursor: pointer;">
+            <input type="checkbox" ${RAIN_CONFIG.followRedirect ? 'checked' : ''} id="rc-redirect" style="margin-right: 6px;" /> 
+            <span style="font-size: 11px;">Follow HTTP Redirects</span>
+          </label>
+          <label style="display: flex; align-items: center; margin-bottom: 6px; cursor: pointer;">
+            <input type="checkbox" ${RAIN_CONFIG.stompEnabled ? 'checked' : ''} id="rc-stomp" style="margin-right: 6px;" /> 
+            <span style="font-size: 11px;">Enable STOMP Interception</span>
+          </label>
+          <label style="display: flex; align-items: center; cursor: pointer;">
+            <input type="checkbox" ${RAIN_CONFIG.autoStartOnLoad ? 'checked' : ''} id="rc-autostart" style="margin-right: 6px;" /> 
+            <span style="font-size: 11px;">Auto-start on Page Load</span>
+          </label>
+        </div>
+
+        <button id="rc-save" class="rain-btn" style="width: 100%; margin-top: 8px;">💾 Save Configuration</button>
+      </div>
+    `;
+
+    content.innerHTML = html;
+
+    document.getElementById("rc-save").onclick = () => {
+      RAIN_CONFIG.claimEndpoint = document.getElementById("rc-endpoint").value;
+      RAIN_CONFIG.method = document.getElementById("rc-method").value;
+      RAIN_CONFIG.intervalMs = parseInt(document.getElementById("rc-interval").value) || 30000;
+      RAIN_CONFIG.maxRetries = parseInt(document.getElementById("rc-retries").value) || 3;
+      RAIN_CONFIG.baseDelayMs = parseInt(document.getElementById("rc-delay").value) || 800;
+      RAIN_CONFIG.timeoutMs = parseInt(document.getElementById("rc-timeout").value) || 12000;
+      RAIN_CONFIG.preferFetch = document.getElementById("rc-fetch").checked;
+      RAIN_CONFIG.followRedirect = document.getElementById("rc-redirect").checked;
+      RAIN_CONFIG.stompEnabled = document.getElementById("rc-stomp").checked;
+      RAIN_CONFIG.autoStartOnLoad = document.getElementById("rc-autostart").checked;
+      persistConfig();
+      pushRainLog("✓ Configuration saved successfully", "log");
+      renderRainConfig();
+    };
+  }
+
+  /**************************************************************************
+   * Clones Tab Renderer
+   **************************************************************************/
+  function renderRainClones() {
+    const html = `
+      <div style="margin-bottom: 8px;">
+        <button id="rc-new" class="rain-btn" style="width: 100%; margin-bottom: 4px;">+ New Clone</button>
+        <div class="rain-row">
+          <button id="rc-import" class="rain-btn" style="flex: 1;">📥 Import</button>
+          <button id="rc-export" class="rain-btn" style="flex: 1;">📤 Export</button>
+        </div>
+      </div>
+      <div id="rc-list" style="max-height: 50vh; overflow-y: auto;"></div>
+    `;
+
+    content.innerHTML = html;
+
+    document.getElementById("rc-new").onclick = () => {
+      const c = {
+        id: uid(),
+        name: `Rain Clone ${RAIN_CLONES.length + 1}`,
+        payload: { body: null },
+        matcher: "",
+        enabled: true,
+        created: nowIso()
+      };
+      RAIN_CLONES.unshift(c);
+      persistClones();
+      pushRainLog("New rain clone created", "log");
+      openRainCloneEditor(c, 0);
+    };
+
+    document.getElementById("rc-import").onclick = () => {
+      const f = document.createElement("input");
+      f.type = "file";
+      f.accept = "application/json";
+      f.onchange = async () => {
+        try {
+          const txt = await f.files[0].text();
+          const arr = JSON.parse(txt);
+          if (!Array.isArray(arr)) throw new Error("Must be array");
+          RAIN_CLONES = arr.concat(RAIN_CLONES);
+          persistClones();
+          pushRainLog(`✓ Imported ${arr.length} clones`, "log");
+          renderRainClones();
+        } catch (e) {
+          alert("Import failed: " + e.message);
+          pushRainLog("✗ Import failed: " + e.message, "error");
+        }
+      };
+      f.click();
+    };
+
+    document.getElementById("rc-export").onclick = () => {
+      const blob = new Blob([JSON.stringify(RAIN_CLONES, null, 2)], { type: "application/json" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `rain-clones-${Date.now()}.json`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 3000);
+      pushRainLog(`✓ Exported ${RAIN_CLONES.length} clones`, "log");
+    };
+
+    const list = document.getElementById("rc-list");
+    list.innerHTML = RAIN_CLONES.length === 0 ? `<div style="color: #666; text-align: center; padding: 20px;">No clones created yet</div>` : "";
+    
+    RAIN_CLONES.forEach((c, i) => {
+      const div = document.createElement("div");
+      div.className = "rain-pre";
+      div.style.cursor = "pointer";
+      div.style.marginBottom = "6px";
+      div.textContent = `📋 ${c.name}\n[${c.enabled ? '✓ enabled' : '✗ disabled'}] matcher: ${c.matcher || 'any'}`;
+      div.title = "Double-click to edit";
+      div.ondblclick = () => openRainCloneEditor(c, i);
+      list.appendChild(div);
+    });
+  }
+
+  /**************************************************************************
+   * Clone Editor Modal
+   **************************************************************************/
+  function openRainCloneEditor(clone, idx) {
+    const cont = document.createElement("div");
+
+    const h = document.createElement("h3");
+    h.textContent = `Edit Rain Clone: ${clone.name}`;
+    cont.appendChild(h);
+
+    const nameLabel = document.createElement("label");
+    nameLabel.className = "rain-label";
+    nameLabel.textContent = "Clone Name:";
+    cont.appendChild(nameLabel);
+    const nameIn = document.createElement("input");
+    nameIn.className = "rain-input rain-row-full";
+    nameIn.value = clone.name || "";
+    cont.appendChild(nameIn);
+
+    const matcherLabel = document.createElement("label");
+    matcherLabel.className = "rain-label";
+    matcherLabel.textContent = "URL Matcher (regex pattern):";
+    cont.appendChild(matcherLabel);
+    const matcherIn = document.createElement("input");
+    matcherIn.className = "rain-input rain-row-full";
+    matcherIn.value = clone.matcher || "";
+    matcherIn.placeholder = "Leave empty to match all";
+    cont.appendChild(matcherIn);
+
+    const enabledLabel = document.createElement("label");
+    enabledLabel.style.display = "flex";
+    enabledLabel.style.alignItems = "center";
+    enabledLabel.style.gap = "6px";
+    enabledLabel.style.marginTop = "8px";
+    const enabledChk = document.createElement("input");
+    enabledChk.type = "checkbox";
+    enabledChk.checked = clone.enabled !== false;
+    enabledLabel.appendChild(enabledChk);
+    enabledLabel.appendChild(document.createTextNode("Enabled"));
+    cont.appendChild(enabledLabel);
+
+    const payloadLabel = document.createElement("label");
+    payloadLabel.className = "rain-label";
+    payloadLabel.textContent = "Payload (JSON):";
+    cont.appendChild(payloadLabel);
+    const payloadArea = document.createElement("textarea");
+    payloadArea.className = "rain-input";
+    payloadArea.style.width = "100%";
+    payloadArea.style.height = "140px";
+    payloadArea.style.fontFamily = "monospace";
+    payloadArea.spellcheck = false;
+    payloadArea.value = JSON.stringify(clone.payload || {}, null, 2);
+    cont.appendChild(payloadArea);
+
+    const createdLabel = document.createElement("div");
+    createdLabel.style.fontSize = "10px";
+    createdLabel.style.color = "#666";
+    createdLabel.style.marginTop = "8px";
+    createdLabel.textContent = `Created: ${new Date(clone.created || nowIso()).toLocaleString()}`;
+    cont.appendChild(createdLabel);
+
+    const btnRow = document.createElement("div");
+    btnRow.style.display = "flex";
+    btnRow.style.gap = "6px";
+    btnRow.style.marginTop = "12px";
+
+    const saveBtn = document.createElement("button");
+    saveBtn.className = "rain-btn";
+    saveBtn.textContent = "💾 Save";
+    saveBtn.onclick = () => {
+      clone.name = nameIn.value || clone.name;
+      clone.matcher = matcherIn.value;
+      clone.enabled = enabledChk.checked;
+      try {
+        clone.payload = JSON.parse(payloadArea.value);
+      } catch (e) {
+        alert("Invalid payload JSON: " + e.message);
+        return;
+      }
+      RAIN_CLONES.splice(idx, 1, clone);
+      persistClones();
+      hideRainModal();
+      pushRainLog(`✓ Rain clone saved: ${clone.name}`, "log");
+      renderRainClones();
+    };
+    btnRow.appendChild(saveBtn);
+
+    const closeBtn = document.createElement("button");
+    closeBtn.className = "rain-btn";
+    closeBtn.textContent = "Close";
+    closeBtn.onclick = hideRainModal;
+    btnRow.appendChild(closeBtn);
+
+    const delBtn = document.createElement("button");
+    delBtn.className = "rain-btn";
+    delBtn.style.background = "#4d1a1a";
+    delBtn.style.borderColor = "#ff4444";
+    delBtn.style.color = "#ff4444";
+    delBtn.textContent = "🗑️ Delete";
+    delBtn.onclick = () => {
+      if (!confirm("Delete clone?")) return;
+      RAIN_CLONES.splice(idx, 1);
+      persistClones();
+      hideRainModal();
+      pushRainLog(`✗ Rain clone deleted`, "warn");
+      renderRainClones();
+    };
+    btnRow.appendChild(delBtn);
+
+    cont.appendChild(btnRow);
+    showRainModal(cont);
+  }
+
+  /**************************************************************************
+   * Auth Tab Renderer
+   **************************************************************************/
+  function renderRainAuth() {
+    const html = `
+      <div style="display: flex; flex-direction: column; gap: 8px;">
+        <div>
+          <label class="rain-label">Bearer Token:</label>
+          <textarea id="ra-token" class="rain-input" style="width: 100%; height: 70px; resize: vertical;">${RAIN_AUTH.bearerToken || ''}</textarea>
+        </div>
+
+        <div>
+          <label class="rain-label">Session ID:</label>
+          <input id="ra-session" class="rain-input rain-row-full" value="${RAIN_AUTH.sessionId || ''}" />
+        </div>
+
+        <div>
+          <label class="rain-label">Custom Headers (JSON):</label>
+          <textarea id="ra-headers" class="rain-input" style="width: 100%; height: 100px; resize: vertical; font-family: monospace;">${JSON.stringify(RAIN_AUTH.customHeaders || {}, null, 2)}</textarea>
+        </div>
+
+        <div>
+          <label class="rain-label">Cookies:</label>
+          <textarea id="ra-cookies" class="rain-input" style="width: 100%; height: 70px; resize: vertical;">${RAIN_AUTH.cookies || ''}</textarea>
+        </div>
+
+        <button id="ra-save" class="rain-btn" style="width: 100%; margin-top: 8px;">💾 Save Authentication</button>
+        
+        <div style="background: #1a1410; padding: 8px; border-radius: 4px; border: 1px solid #3a3a2a; font-size: 10px; color: #666;">
+          ℹ️ Token will be sent as: Authorization: Bearer &lt;token&gt;
+        </div>
+      </div>
+    `;
+
+    content.innerHTML = html;
+
+    document.getElementById("ra-save").onclick = () => {
+      RAIN_AUTH.bearerToken = document.getElementById("ra-token").value;
+      RAIN_AUTH.sessionId = document.getElementById("ra-session").value;
+      try {
+        RAIN_AUTH.customHeaders = JSON.parse(document.getElementById("ra-headers").value || "{}");
+      } catch (e) {
+        alert("Invalid headers JSON: " + e.message);
+        return;
+      }
+      RAIN_AUTH.cookies = document.getElementById("ra-cookies").value;
+      persistAuth();
+      pushRainLog("✓ Authentication updated", "log");
+      renderRainAuth();
+    };
+  }
+
+  /**************************************************************************
+   * Logs Tab Renderer
+   **************************************************************************/
+  function renderRainLogs() {
+    const html = `
+      <div style="margin-bottom: 8px;">
+        <div class="rain-row">
+          <button id="rl-clear" class="rain-btn" style="flex: 1;">🗑️ Clear</button>
+          <button id="rl-export" class="rain-btn" style="flex: 1;">📤 Export</button>
+        </div>
+        <div style="font-size: 10px; color: #666; padding: 4px;">Total logs: ${RAIN_LOGS.length}</div>
+      </div>
+      <div id="rl-list" style="max-height: 55vh; overflow-y: auto;"></div>
+    `;
+
+    content.innerHTML = html;
+
+    document.getElementById("rl-clear").onclick = () => {
+      if (!confirm("Clear all logs?")) return;
+      RAIN_LOGS = [];
+      persistLogs();
+      renderRainLogs();
+    };
+
+    document.getElementById("rl-export").onclick = () => {
+      const blob = new Blob([JSON.stringify(RAIN_LOGS, null, 2)], { type: "application/json" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `rain-logs-${Date.now()}.json`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 3000);
+      pushRainLog(`✓ Exported ${RAIN_LOGS.length} logs`, "log");
+    };
+
+    const list = document.getElementById("rl-list");
+    list.innerHTML = "";
+    
+    if (RAIN_LOGS.length === 0) {
+      list.innerHTML = `<div style="color: #666; text-align: center; padding: 20px;">No logs yet</div>`;
+      return;
+    }
+
+    for (let i = RAIN_LOGS.length - 1; i >= 0; i--) {
+      const e = RAIN_LOGS[i];
+      const div = document.createElement("div");
+      div.className = "rain-pre";
+      
+      const typeColorMap = {
+        error: "#ff4444",
+        warn: "#ffeb3b",
+        log: "#4caf50",
+        success: "#4caf50"
+      };
+      
+      div.style.borderLeftColor = typeColorMap[e.type] || "#ffeb3b";
+      const timeStr = new Date(e.ts).toLocaleTimeString();
+      div.textContent = `[${timeStr}] ${e.line}`;
+      div.title = JSON.stringify(e.meta, null, 2);
+      list.appendChild(div);
+    }
+  }
+
+  /**************************************************************************
+   * Rain Engine: Core Claim Logic
+   **************************************************************************/
+  const rainEngine = (() => {
+    const state = {
+      running: false,
+      timer: null,
+      currentRun: null
+    };
+
+    function sleep(ms) {
+      return new Promise(r => setTimeout(r, ms));
+    }
+
+    function backoffDelay(attempt) {
+      const base = RAIN_CONFIG.baseDelayMs * Math.pow(1.8, attempt);
+      return base + Math.floor(Math.random() * (base * 0.3));
+    }
+
+    function promiseTimeout(p, ms) {
+      let id;
+      const t = new Promise((_, rej) => id = setTimeout(() => rej(new Error("timeout")), ms));
+      return Promise.race([p, t]).finally(() => clearTimeout(id));
+    }
+
+    async function attemptFetch(url, body, headers, method) {
+      const opts = {
+        method: method || RAIN_CONFIG.method,
+        headers: Object.assign({}, RAIN_CONFIG.headers || {}, headers || {}),
+        cache: "no-store",
+        redirect: RAIN_CONFIG.followRedirect ? "follow" : "manual"
+      };
+      if (body !== undefined && body !== null) {
+        if (typeof body === "object") opts.body = JSON.stringify(body);
+        else opts.body = body;
+      }
+      const resp = await promiseTimeout(fetch(url, opts), RAIN_CONFIG.timeoutMs);
+      const status = resp.status;
+      let text = null, json = null;
+      try { text = await resp.clone().text().catch(() => null); } catch (e) {}
+      try { json = await resp.clone().json().catch(() => null); } catch (e) {}
+      return { status, text, json, resp };
+    }
+
+    function attemptXHR(url, body, headers, method) {
+      return new Promise((resolve, reject) => {
+        try {
+          const xhr = new XMLHttpRequest();
+          xhr.open(method || RAIN_CONFIG.method, url, true);
+          for (const k in headers || {}) {
+            try { xhr.setRequestHeader(k, headers[k]); } catch (e) {}
+          }
+          xhr.timeout = RAIN_CONFIG.timeoutMs;
+          xhr.onload = () => resolve({ status: xhr.status, text: xhr.responseText, resp: xhr });
+          xhr.onerror = () => reject(new Error("xhr error"));
+          xhr.ontimeout = () => reject(new Error("xhr timeout"));
+          if (body) {
+            if (typeof body === "object") xhr.send(JSON.stringify(body));
+            else xhr.send(body);
+          } else {
+            xhr.send();
+          }
+        } catch (e) { reject(e); }
+      });
+    }
+
+    function defaultSuccessHeuristic(text, status, json) {
+      if (status >= 200 && status < 300) return true;
+      if (json && (json.success || json.result === "ok" || json.status === "ok" || json.claimed)) return true;
+      if (typeof text === "string" && /success|claimed|ok|won|reward/i.test(text)) return true;
+      return false;
+    }
+
+    async function runOnce(opts = {}) {
+      const runId = `rain-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+      const url = opts.url || RAIN_CONFIG.claimEndpoint;
+
+      if (!url) {
+        const msg = { id: runId, success: false, reason: "no-endpoint", ts: nowIso() };
+        RAIN_STATS.failures++;
+        persistStats();
+        pushRainLog("❌ No claim endpoint configured", "error");
+        return msg;
+      }
+
+      RAIN_STATS.attempts++;
+      RAIN_STATS.lastAttempt = nowIso();
+      persistStats();
+
+      let payload = opts.body || RAIN_CONFIG.payload || null;
+
+      // Apply rain clones
+      let appliedClones = 0;
+      for (const clone of RAIN_CLONES) {
+        if (!clone.enabled) continue;
+        if (clone.matcher) {
+          try {
+            if (!new RegExp(clone.matcher).test(url)) continue;
+          } catch (e) { continue; }
+        }
+        if (clone.payload && typeof clone.payload === "object") {
+          payload = Object.assign({}, payload || {}, clone.payload);
+          appliedClones++;
+        }
+      }
+
+      if (appliedClones > 0) {
+        pushRainLog(`Applied ${appliedClones} clone(s)`, "log");
+      }
+
+      let headers = Object.assign({}, RAIN_CONFIG.headers || {}, RAIN_AUTH.customHeaders || {});
+      if (RAIN_AUTH.bearerToken) {
+        headers["Authorization"] = `Bearer ${RAIN_AUTH.bearerToken}`;
+      }
+      if (RAIN_AUTH.sessionId) {
+        headers["X-Session-ID"] = RAIN_AUTH.sessionId;
+      }
+
+      pushRainLog(`🎯 Claiming...`, "log", { runId, url });
+
+      for (let attempt = 0; attempt < (opts.maxRetries || RAIN_CONFIG.maxRetries); attempt++) {
+        try {
+          let res;
+          if (RAIN_CONFIG.preferFetch && window.fetch) {
+            res = await attemptFetch(url, payload, headers, opts.method || RAIN_CONFIG.method);
+          } else {
+            res = await attemptXHR(url, payload, headers, opts.method || RAIN_CONFIG.method);
+          }
+
+          const success = (opts.successHeuristic || defaultSuccessHeuristic)(res.text, res.status, res.json);
+          const result = {
+            id: runId,
+            attempt,
+            success: success,
+            status: res.status,
+            response: (res.text || "").slice(0, 300),
+            ts: nowIso()
+          };
+
+          if (success) {
+            RAIN_STATS.successes++;
+            RAIN_STATS.lastSuccess = nowIso();
+            persistStats();
+            pushRainLog(`✓ CLAIMED! Status: ${res.status}`, "log", result);
+            return result;
+          } else {
+            pushRainLog(`Attempt ${attempt + 1}: Status ${res.status}`, "warn");
+          }
+        } catch (err) {
+          pushRainLog(`Attempt ${attempt + 1} failed: ${String(err)}`, "error", { attempt, error: String(err) });
+          if (attempt < (opts.maxRetries || RAIN_CONFIG.maxRetries) - 1) {
+            const delay = backoffDelay(attempt);
+            await sleep(delay);
+          }
+          continue;
+        }
+      }
+
+      RAIN_STATS.failures++;
+      persistStats();
+      pushRainLog(`✗ All attempts exhausted`, "error", { runId });
+      return { id: runId, success: false, reason: "all-retries-exhausted", ts: nowIso() };
+    }
+
+    async function startLoop(opts = {}) {
+      if (state.running) return;
+      state.running = true;
+      pushRainLog("🔄 Loop started", "log");
+      
+      (async function loop() {
+        while (state.running) {
+          try {
+            await runOnce(opts);
+          } catch (e) {
+            pushRainLog(`Loop error: ${String(e)}`, "error");
+          }
+          await sleep(opts.intervalMs || RAIN_CONFIG.intervalMs);
+        }
+      })();
+    }
+
+    function stopLoop() {
+      state.running = false;
+      pushRainLog("⏹ Loop stopped", "warn");
+    }
+
+    return {
+      runOnce,
+      startLoop,
+      stopLoop,
+      getState: () => state
+    };
+  })();
+
+  /**************************************************************************
+   * WebSocket/STOMP Interception for Rain
+   **************************************************************************/
+  const original = { WebSocket: window.WebSocket };
+
+  function isStompFrame(txt) {
+    if (!txt || typeof txt !== "string") return false;
+    return /^(CONNECT|SEND|MESSAGE|SUBSCRIBE|UNSUBSCRIBE|ACK|NACK|DISCONNECT|BEGIN|COMMIT|ABORT)/.test(txt.trim().slice(0, 12).toUpperCase());
+  }
+
+  function parseStompFrame(raw) {
+    try {
+      const firstNl = raw.indexOf("\n");
+      const command = raw.slice(0, firstNl).trim();
+      const rest = raw.slice(firstNl + 1);
+      const parts = rest.split("\n\n");
+      const headerPart = parts[0] || "";
+      const bodyPart = parts.slice(1).join("\n\n").replace(/\0$/, "");
+      const headers = {};
+      (headerPart.split("\n") || []).forEach(line => {
+        const i = line.indexOf(":");
+        if (i >= 0) headers[line.slice(0, i)] = line.slice(i + 1);
+      });
+      let body = bodyPart;
+      try { body = JSON.parse(bodyPart); } catch (e) {}
+      return { command, headers, body };
+    } catch (e) {
+      return { command: "UNKNOWN", headers: {}, body: raw };
+    }
+  }
+
+  if (original.WebSocket && RAIN_CONFIG.stompEnabled) {
+    const OrigWS = original.WebSocket;
+
+    function WrappedWS(url, protocols) {
+      const ws = protocols ? new OrigWS(url, protocols) : new OrigWS(url);
+      const origSend = ws.send.bind(ws);
+
+      ws.send = function (data) {
+        try {
+          if (typeof data === "string" && isStompFrame(data)) {
+            const parsed = parseStompFrame(data);
+            pushRainLog(`📤 STOMP→ ${parsed.command}`, "log", parsed);
+          }
+        } catch (e) {}
+        return origSend(data);
+      };
+
+      ws.addEventListener("message", function (ev) {
+        try {
+          if (typeof ev.data === "string" && isStompFrame(ev.data)) {
+            const parsed = parseStompFrame(ev.data);
+            pushRainLog(`📥 STOMP← ${parsed.command}`, "log", parsed);
+          }
+        } catch (e) {}
+      });
+
+      return ws;
+    }
+
+    WrappedWS.prototype = OrigWS.prototype;
+    window.WebSocket = WrappedWS;
+  }
+
+  /**************************************************************************
+   * Public API
+   **************************************************************************/
+  window.Rain = window.Rain || {};
+  window.Rain.claim = () => rainEngine.runOnce();
+  window.Rain.startLoop = (opts) => rainEngine.startLoop(opts);
+  window.Rain.stopLoop = () => rainEngine.stopLoop();
+  window.Rain.setEndpoint = (url) => {
+    RAIN_CONFIG.claimEndpoint = url;
+    persistConfig();
+  };
+  window.Rain.setAuth = (token) => {
+    RAIN_AUTH.bearerToken = token;
+    persistAuth();
+  };
+  window.Rain.getStatus = () => ({
+    config: RAIN_CONFIG,
+    stats: RAIN_STATS,
+    isRunning: rainEngine.getState().running,
+    clones: RAIN_CLONES.length,
+    logs: RAIN_LOGS.length
+  });
+  window.Rain.addClone = (clone) => {
+    RAIN_CLONES.push(clone);
+    persistClones();
+  };
+
+  /**************************************************************************
+   * Lifecycle & Initialization
+   **************************************************************************/
+  
+  // Auto-start if configured
+  window.addEventListener("load", () => {
+    if (RAIN_CONFIG.autoStartOnLoad) {
+      rainEngine.startLoop();
+      pushRainLog("Auto-started claim loop on page load", "log");
+    }
+  });
+
+  // Listen for cross-script messages
+  window.addEventListener("message", (e) => {
+    try {
+      const m = e.data;
+      if (!m || !m.ni) return;
+      if (m.source === "interceptor" && m.type === "log") {
+        if (m.payload.line && m.payload.line.toLowerCase().includes("rain")) {
+          pushRainLog(`[Interceptor] ${m.payload.line}`, "log");
+        }
+      }
+    } catch (e) {}
+  });
+
+  // Persist stats periodically
+  setInterval(() => {
+    persistStats();
+  }, 30000);
+
+  // Cleanup on page unload
+  window.addEventListener("beforeunload", () => {
+    if (rainEngine.getState().running) {
+      rainEngine.stopLoop();
+    }
+  });
+
+  /**************************************************************************
+   * Final Initialization
+   **************************************************************************/
+  setRainTab("Status");
+  pushRainLog("⛅ Rain Claim Interceptor v2.0 loaded successfully", "log");
+  pushRainLog(`User: @${window.location.hostname}`, "log");
+
+})();
