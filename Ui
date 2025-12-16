@@ -1,223 +1,452 @@
 // /Ui.js
-// Mini DevTools+ Overlay v4 — Snippets + Frames + GitHub Loader
+// Mini DevTools+ Overlay v4.2 — Freeze-safe, per-frame snippet + frame picker
+
 (() => {
   "use strict";
 
-  /* ===============================
-     Storage Keys
-  =============================== */
   const STORAGE_SNIPPETS = "mcc_snippets_v4";
   const STORAGE_BTN = "mcc_button_pos_v4";
 
   let snippets = JSON.parse(localStorage.getItem(STORAGE_SNIPPETS) || "{}");
-
-  function saveSnippets() {
+  const saveSnippets = () =>
     localStorage.setItem(STORAGE_SNIPPETS, JSON.stringify(snippets));
-  }
 
-  /* ===============================
-     Toast Helper
-  =============================== */
+  /* ================= Toast ================= */
   function toast(msg, timeout = 3000) {
     let t = document.getElementById("mcc_toast");
     if (!t) {
       t = document.createElement("div");
       t.id = "mcc_toast";
-      Object.assign(t.style,{
-        position:"fixed",left:"50%",bottom:"80px",
-        transform:"translateX(-50%)",
-        background:"#222",color:"#fff",
-        padding:"10px 14px",borderRadius:"8px",
-        zIndex:9999999,fontFamily:"system-ui,monospace",
-        fontSize:"13px",opacity:0,transition:"opacity 0.3s"
+      Object.assign(t.style, {
+        position: "fixed",
+        left: "50%",
+        bottom: "80px",
+        transform: "translateX(-50%)",
+        background: "#222",
+        color: "#fff",
+        padding: "10px 14px",
+        borderRadius: "8px",
+        zIndex: 9999999,
+        fontFamily: "system-ui,monospace",
+        fontSize: "13px",
+        opacity: 0,
+        transition: "opacity 0.3s",
       });
       document.body.appendChild(t);
     }
     t.textContent = msg;
-    t.style.opacity="1";
+    t.style.opacity = "1";
     clearTimeout(t._to);
-    t._to = setTimeout(()=>{ t.style.opacity="0"; },timeout);
+    t._to = setTimeout(() => (t.style.opacity = "0"), timeout);
   }
 
-  /* ===============================
-     Floating Button
-  =============================== */
+  /* ================= Floating Button ================= */
   const floatBtn = document.createElement("button");
-  floatBtn.textContent="≡";
-  Object.assign(floatBtn.style,{
-    position:"fixed",top:"40px",left:"10px",width:"56px",height:"56px",
-    borderRadius:"50%",background:"#1e1e1e",color:"#fff",fontSize:"26px",
-    display:"flex",alignItems:"center",justifyContent:"center",
-    boxShadow:"0 6px 18px rgba(0,0,0,0.6)",border:"none",cursor:"pointer",
-    zIndex:9999998,touchAction:"none"
+  floatBtn.textContent = "≡";
+  Object.assign(floatBtn.style, {
+    position: "fixed",
+    top: "40px",
+    left: "10px",
+    width: "56px",
+    height: "56px",
+    borderRadius: "50%",
+    background: "#1e1e1e",
+    color: "#fff",
+    fontSize: "26px",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    boxShadow: "0 6px 18px rgba(0,0,0,0.6)",
+    border: "none",
+    cursor: "pointer",
+    zIndex: 9999998,
+    touchAction: "none",
   });
   document.body.appendChild(floatBtn);
-  // restore position
-  try{ const pos=JSON.parse(localStorage.getItem(STORAGE_BTN)); if(pos){ floatBtn.style.left=pos.left; floatBtn.style.top=pos.top; } } catch{}
-  // draggable
-  (function(){
-    let dragging=false,sx=0,sy=0,sl=0,st=0;
-    floatBtn.addEventListener("pointerdown",(e)=>{dragging=true;sx=e.clientX;sy=e.clientY;sl=floatBtn.offsetLeft;st=floatBtn.offsetTop;floatBtn.setPointerCapture(e.pointerId)});
-    floatBtn.addEventListener("pointermove",(e)=>{if(!dragging)return; floatBtn.style.left=Math.max(4,sl+(e.clientX-sx))+"px"; floatBtn.style.top=Math.max(4,st+(e.clientY-sy))+"px";});
-    floatBtn.addEventListener("pointerup",(e)=>{if(!dragging)return; dragging=false; floatBtn.releasePointerCapture(e.pointerId); localStorage.setItem(STORAGE_BTN,JSON.stringify({left:floatBtn.style.left,top:floatBtn.style.top}));});
+
+  try {
+    const pos = JSON.parse(localStorage.getItem(STORAGE_BTN));
+    if (pos) {
+      floatBtn.style.left = pos.left;
+      floatBtn.style.top = pos.top;
+    }
+  } catch {}
+
+  (() => {
+    let dragging = false,
+      sx = 0,
+      sy = 0,
+      sl = 0,
+      st = 0;
+    floatBtn.addEventListener("pointerdown", (e) => {
+      dragging = true;
+      sx = e.clientX;
+      sy = e.clientY;
+      sl = floatBtn.offsetLeft;
+      st = floatBtn.offsetTop;
+      floatBtn.setPointerCapture(e.pointerId);
+    });
+    floatBtn.addEventListener("pointermove", (e) => {
+      if (!dragging) return;
+      floatBtn.style.left = Math.max(4, sl + (e.clientX - sx)) + "px";
+      floatBtn.style.top = Math.max(4, st + (e.clientY - sy)) + "px";
+    });
+    floatBtn.addEventListener("pointerup", (e) => {
+      dragging = false;
+      floatBtn.releasePointerCapture(e.pointerId);
+      localStorage.setItem(
+        STORAGE_BTN,
+        JSON.stringify({ left: floatBtn.style.left, top: floatBtn.style.top })
+      );
+    });
   })();
 
-  /* ===============================
-     Panel
-  =============================== */
-  const panel=document.createElement("div");
-  Object.assign(panel.style,{
-    position:"fixed",right:"-100%",top:"0",width:"90%",height:"100%",
-    background:"#111",color:"#fff",zIndex:9999997,boxShadow:"0 0 30px rgba(0,0,0,0.7)",
-    transition:"right 0.25s",display:"flex",flexDirection:"column",fontFamily:"monospace",
-    overflow:"auto",paddingBottom:"24px"
+  /* ================= Panel ================= */
+  const panel = document.createElement("div");
+  Object.assign(panel.style, {
+    position: "fixed",
+    right: "-100%",
+    top: "0",
+    width: "90%",
+    height: "100%",
+    background: "#111",
+    color: "#fff",
+    zIndex: 9999997,
+    boxShadow: "0 0 30px rgba(0,0,0,0.7)",
+    transition: "right 0.25s",
+    display: "flex",
+    flexDirection: "column",
+    fontFamily: "monospace",
   });
   document.body.appendChild(panel);
-  let panelOpen=false;
-  floatBtn.onclick=()=>{ panelOpen=!panelOpen; panel.style.right=panelOpen?"0":"-100%"; };
 
-  // header
-  const header=document.createElement("div");
-  header.style.display="flex"; header.style.justifyContent="space-between"; header.style.alignItems="center";
-  header.style.padding="12px"; header.style.background="#151515"; header.style.borderBottom="1px solid #222";
-  const htitle=document.createElement("div"); htitle.textContent="Mini DevTools+";
-  const hclose=document.createElement("button"); hclose.textContent="✕";
-  Object.assign(hclose.style,{background:"#222",color:"#fff",border:"none",padding:"6px 12px",borderRadius:"6px",cursor:"pointer"});
-  hclose.onclick=()=>{ panelOpen=false; panel.style.right="-100%"; };
-  header.appendChild(htitle); header.appendChild(hclose);
+  let panelOpen = false;
+  floatBtn.onclick = () => {
+    panelOpen = !panelOpen;
+    panel.style.right = panelOpen ? "0" : "-100%";
+  };
+
+  const header = document.createElement("div");
+  Object.assign(header.style, {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    padding: "12px",
+    background: "#151515",
+    borderBottom: "1px solid #222",
+  });
+  const htitle = document.createElement("div");
+  htitle.textContent = "Mini DevTools+";
+  const hclose = document.createElement("button");
+  hclose.textContent = "✕";
+  Object.assign(hclose.style, {
+    background: "#222",
+    color: "#fff",
+    border: "none",
+    padding: "6px 12px",
+    borderRadius: "6px",
+    cursor: "pointer",
+  });
+  hclose.onclick = () => {
+    panelOpen = false;
+    panel.style.right = "-100%";
+  };
+  header.appendChild(htitle);
+  header.appendChild(hclose);
   panel.appendChild(header);
 
-  // tabs container
-  const tabsDiv=document.createElement("div");
-  tabsDiv.style.display="flex"; tabsDiv.style.gap="4px"; tabsDiv.style.padding="6px"; tabsDiv.style.background="#000";
-  const tabNames=["Snippets","Frames","GitHub"];
-  let activeTab="Snippets";
-  const tabButtons={};
-  tabNames.forEach(name=>{
-    const b=document.createElement("button"); b.textContent=name; b.dataset.tab=name;
-    b.style.flex="1"; b.style.padding="6px"; b.style.background="#222"; b.style.color="#fff"; b.style.border="none"; b.style.borderRadius="4px";
-    b.onclick=()=>{ activeTab=name; drawActiveTab(); };
-    tabsDiv.appendChild(b); tabButtons[name]=b;
+  /* ================= Tabs ================= */
+  const tabsDiv = document.createElement("div");
+  Object.assign(tabsDiv.style, {
+    display: "flex",
+    gap: "4px",
+    padding: "6px",
+    background: "#000",
+  });
+  const tabNames = ["Snippets", "Frames", "GitHub"];
+  let activeTab = "Snippets";
+  const tabButtons = {};
+  tabNames.forEach((name) => {
+    const b = document.createElement("button");
+    b.textContent = name;
+    Object.assign(b.style, {
+      flex: "1",
+      padding: "6px",
+      background: "#222",
+      color: "#fff",
+      border: "none",
+      borderRadius: "4px",
+    });
+    b.onclick = () => {
+      activeTab = name;
+      drawActiveTab();
+    };
+    tabsDiv.appendChild(b);
+    tabButtons[name] = b;
   });
   panel.appendChild(tabsDiv);
 
-  // content container
-  const contentDiv=document.createElement("div");
-  contentDiv.style.flex="1"; contentDiv.style.overflow="auto"; contentDiv.style.padding="8px"; panel.appendChild(contentDiv);
+  const contentDiv = document.createElement("div");
+  Object.assign(contentDiv.style, {
+    flex: "1",
+    overflow: "auto",
+    padding: "8px",
+  });
+  panel.appendChild(contentDiv);
 
-  /* ===============================
-     Frames Tree
-  =============================== */
-  function getFramesTree(win=window,parentId=null,depth=0){
-    const frames=[];
-    const ifrs=win.document? [...win.document.querySelectorAll("iframe")]:[];
-    ifrs.forEach((f,i)=>{
-      let label="";
-      let accessible=true, sandbox="";
-      // sandbox
-      try{ sandbox=f.sandbox?f.sandbox.value:""; }catch{}
-      // label priority: name > id > src > fallback
-      if(f.name) label=`${f.name}`;
-      else if(f.id) label=`#${f.id}`;
-      else if(f.src) label=(f.src.length>40?f.src.slice(0,40)+"…":f.src);
-      else label=`iframe ${i}`;
-      let winRef=null;
-      try{ winRef=f.contentWindow; void winRef.location.href; }catch{ accessible=false; winRef=null; label="Cross-Origin "+label; }
-      frames.push({id:parentId?parentId+"_"+i:"f_"+i,label,win:winRef,depth,hidden:f.offsetParent===null, sandbox, children:getFramesTree(winRef,parentId?parentId+"_"+i:"f_"+i,depth+1)}); 
+  /* ================= Frame Collector ================= */
+  function collectFrames(win = window, parentId = "top", depth = 0, out = []) {
+    if (!win || !win.document) return out;
+    out.push({ id: parentId, win, depth });
+
+    const iframes = win.document.querySelectorAll("iframe");
+    iframes.forEach((f, i) => {
+      const fid = parentId + "_f" + i;
+      try {
+        const w = f.contentWindow;
+        void w.location.href;
+        collectFrames(w, fid, depth + 1, out);
+      } catch {
+        out.push({ id: fid, win: null, depth: depth + 1 });
+      }
     });
-    return frames;
+    return out;
   }
 
   function drawFrameTree() {
-    contentDiv.innerHTML="";
-    const tree=getFramesTree();
-    function renderNode(node){
-      const div=document.createElement("div");
-      div.style.marginLeft=(node.depth*14)+"px"; div.style.display="flex"; div.style.alignItems="center"; div.style.gap="6px";
-      const lbl=document.createElement("span");
-      lbl.textContent=node.label+(node.hidden?" [hidden]":"")+(node.sandbox?" [sandbox:"+node.sandbox+"]":"")+(node.win?"":" [no-access]");
-      div.appendChild(lbl);
+    contentDiv.innerHTML = "";
+    const tree = collectFrames();
+    tree.forEach((f) => {
+      const div = document.createElement("div");
+      div.style.marginLeft = f.depth * 14 + "px";
+      div.textContent =
+        f.id + (f.win ? "" : " [cross-origin/no-access]");
       contentDiv.appendChild(div);
-      node.children.forEach(child=>renderNode(child));
-    }
-    tree.forEach(n=>renderNode(n));
+    });
   }
 
-  /* ===============================
-     Snippets Tab
-  =============================== */
-  function drawSnippetsTab(){
-    contentDiv.innerHTML="";
-    const editor=document.createElement("div"); editor.style.display="flex"; editor.style.flexDirection="column"; editor.style.gap="6px";
-    const nameInput=document.createElement("input"); nameInput.placeholder="Snippet Name"; nameInput.style.padding="6px";
-    const codeArea=document.createElement("textarea"); codeArea.rows=8; codeArea.placeholder="// JS Code"; codeArea.style.padding="6px";
-    const targetSelect=document.createElement("select"); targetSelect.style.padding="6px";
-    const modeSelect=document.createElement("select"); ["manual","start","idle","end","always"].forEach(m=>{ const o=document.createElement("option"); o.value=m; o.textContent=m; modeSelect.appendChild(o); });
-    const saveBtn=document.createElement("button"); saveBtn.textContent="Save"; const runBtn=document.createElement("button"); runBtn.textContent="Run"; const delBtn=document.createElement("button"); delBtn.textContent="Delete";
-    [saveBtn,runBtn,delBtn].forEach(b=>{b.style.padding="6px"; b.style.borderRadius="6px"; b.style.border="none"; b.style.background="#222"; b.style.color="#fff"; editor.appendChild(b);});
-    editor.appendChild(nameInput); editor.appendChild(codeArea); editor.appendChild(targetSelect); editor.appendChild(modeSelect);
+  /* ================= Eval Bridge ================= */
+  function injectEvalBridge(win) {
+    try {
+      if (!win || win.__MCC_BRIDGE__) return;
+      win.__MCC_BRIDGE__ = true;
+      win.addEventListener("message", (e) => {
+        if (!e.data || !e.data.__MCC_EVAL__) return;
+        try {
+          win.eval(e.data.code);
+        } catch (err) {
+          console.error("[MCC eval error]", err);
+        }
+      });
+    } catch {}
+  }
+  injectEvalBridge(window);
+
+  function execInWindow(win, code) {
+    if (!win) return false;
+    try {
+      win.eval(code);
+      return true;
+    } catch {
+      try {
+        win.postMessage({ __MCC_EVAL__: true, code }, "*");
+        return true;
+      } catch {
+        return false;
+      }
+    }
+  }
+
+  /* ================= Snippets Tab ================= */
+  function drawSnippetsTab() {
+    contentDiv.innerHTML = "";
+
+    const editor = document.createElement("div");
+    editor.style.display = "flex";
+    editor.style.flexDirection = "column";
+    editor.style.gap = "6px";
+
+    const nameInput = document.createElement("input");
+    nameInput.placeholder = "Snippet Name";
+    nameInput.style.padding = "6px";
+
+    const codeArea = document.createElement("textarea");
+    codeArea.rows = 8;
+    codeArea.placeholder = "// JS Code";
+    codeArea.style.padding = "6px";
+
+    const targetSelect = document.createElement("select");
+    targetSelect.style.padding = "6px";
+
+    const modeSelect = document.createElement("select");
+    ["manual", "start", "always"].forEach((m) => {
+      const o = document.createElement("option");
+      o.value = m;
+      o.textContent = m;
+      modeSelect.appendChild(o);
+    });
+
+    const saveBtn = document.createElement("button");
+    saveBtn.textContent = "Save + Run";
+
+    const delBtn = document.createElement("button");
+    delBtn.textContent = "Delete";
+
+    [saveBtn, delBtn].forEach((b) => {
+      b.style.padding = "6px";
+      b.style.borderRadius = "6px";
+      b.style.border = "none";
+      b.style.background = "#222";
+      b.style.color = "#fff";
+      editor.appendChild(b);
+    });
+
+    editor.appendChild(nameInput);
+    editor.appendChild(codeArea);
+    editor.appendChild(targetSelect);
+    editor.appendChild(modeSelect);
+
     contentDiv.appendChild(editor);
 
-    // populate frames
-    const framesFlat=getFramesTree();
-    function flattenFrames(arr){ return arr.reduce((acc,n)=>[...acc,n,...flattenFrames(n.children)],[]); }
-    const flatFrames=flattenFrames(framesFlat);
-    targetSelect.innerHTML=""; flatFrames.forEach((f,i)=>{ const opt=document.createElement("option"); opt.value=i; opt.textContent=`${i}. ${f.label}`; if(!f.win) opt.disabled=true; targetSelect.appendChild(opt); });
+    function refreshTargets() {
+      const frames = collectFrames();
+      targetSelect.innerHTML = "";
+      frames.forEach((f, i) => {
+        const opt = document.createElement("option");
+        opt.value = f.id;
+        opt.textContent = f.id + (f.win ? "" : " [no-access]");
+        if (!f.win) opt.disabled = true;
+        targetSelect.appendChild(opt);
+      });
+    }
+    refreshTargets();
 
-    function runSnippet(s){
-      const idx=parseInt(s.target||0,10);
-      const f=flatFrames[idx]; if(!f) return toast("Invalid frame");
-      if(f.win){ try{ f.win.eval(s.code); toast("Ran "+s.name);}catch{ f.win.postMessage({__mcc_eval:true,code:s.code},"*"); toast("PostMessage fallback"); } }
-      else toast("No access");
+    function runSnippetById(s) {
+      const frames = collectFrames();
+      let ran = 0;
+      if (s.target === "top") ran += execInWindow(window, s.code) ? 1 : 0;
+      else if (s.target === "all")
+        frames.forEach((f) => (ran += execInWindow(f.win, s.code) ? 1 : 0));
+      else {
+        const f = frames.find((x) => x.id === s.target);
+        if (f) ran += execInWindow(f.win, s.code) ? 1 : 0;
+      }
+      toast(`Snippet ran in ${ran} frame(s)`);
     }
 
-    saveBtn.onclick=()=>{
-      const n=nameInput.value.trim(); if(!n) return toast("Provide name");
-      snippets[n]={name:n,code:codeArea.value,target:targetSelect.value,mode:modeSelect.value};
-      saveSnippets(); toast("Saved"); runSnippet(snippets[n]);
+    saveBtn.onclick = () => {
+      const n = nameInput.value.trim();
+      if (!n) return toast("Provide name");
+      snippets[n] = {
+        name: n,
+        code: codeArea.value,
+        target: targetSelect.value,
+        mode: modeSelect.value,
+      };
+      saveSnippets();
+      runSnippetById(snippets[n]);
+      refreshTargets();
     };
-    runBtn.onclick=()=>{ const n=nameInput.value.trim(); if(snippets[n]) runSnippet(snippets[n]); else toast("Snippet not found"); };
-    delBtn.onclick=()=>{ const n=nameInput.value.trim(); if(snippets[n]){ delete snippets[n]; saveSnippets(); toast("Deleted"); }else toast("Not found"); };
-  }
 
-  /* ===============================
-     GitHub Loader
-  =============================== */
-  function drawGitHubTab(){
-    contentDiv.innerHTML="";
-    const urlInput=document.createElement("input"); urlInput.placeholder="GitHub Raw URL"; urlInput.style.width="100%"; urlInput.style.padding="6px";
-    const fetchBtn=document.createElement("button"); fetchBtn.textContent="Fetch"; fetchBtn.style.margin="4px 0"; const copyBtn=document.createElement("button"); copyBtn.textContent="Copy"; const saveBtn=document.createElement("button"); saveBtn.textContent="Save as Snippet";
-    [fetchBtn,copyBtn,saveBtn].forEach(b=>{b.style.padding="6px"; b.style.borderRadius="6px"; b.style.border="none"; b.style.background="#222"; b.style.color="#fff"; b.style.marginRight="4px";});
-    const pre=document.createElement("pre"); pre.style.background="#000"; pre.style.color="#0f0"; pre.style.padding="6px"; pre.style.overflowX="auto"; pre.style.maxHeight="300px";
-    contentDiv.appendChild(urlInput); contentDiv.appendChild(fetchBtn); contentDiv.appendChild(copyBtn); contentDiv.appendChild(saveBtn); contentDiv.appendChild(pre);
-
-    fetchBtn.onclick=async()=>{
-      const url=urlInput.value.trim(); if(!url) return toast("Enter URL");
-      try{ const txt=await fetch(url).then(r=>r.text()); pre.textContent=txt; toast("Fetched"); }catch{toast("Failed");}
-    };
-    copyBtn.onclick=()=>{ navigator.clipboard.writeText(pre.textContent).then(()=>toast("Copied")); };
-    saveBtn.onclick=()=>{
-      const code=pre.textContent; if(!code) return toast("No code");
-      const name="GH_"+Math.floor(Math.random()*9999);
-      snippets[name]={name,code,target:0,mode:"manual"}; saveSnippets(); toast("Saved snippet: "+name);
+    delBtn.onclick = () => {
+      const n = nameInput.value.trim();
+      if (snippets[n]) {
+        delete snippets[n];
+        saveSnippets();
+        toast("Deleted");
+        refreshTargets();
+      } else toast("Not found");
     };
   }
 
-  /* ===============================
-     Tab Switcher
-  =============================== */
-  function drawActiveTab(){
-    if(activeTab==="Frames") drawFrameTree();
-    else if(activeTab==="Snippets") drawSnippetsTab();
-    else if(activeTab==="GitHub") drawGitHubTab();
+  /* ================= GitHub Loader ================= */
+  function drawGitHubTab() {
+    contentDiv.innerHTML = "";
+    const urlInput = document.createElement("input");
+    urlInput.placeholder = "GitHub Raw URL";
+    urlInput.style.width = "100%";
+    urlInput.style.padding = "6px";
+
+    const fetchBtn = document.createElement("button");
+    fetchBtn.textContent = "Fetch";
+    const copyBtn = document.createElement("button");
+    copyBtn.textContent = "Copy";
+    const saveBtn = document.createElement("button");
+    saveBtn.textContent = "Save as Snippet";
+
+    [fetchBtn, copyBtn, saveBtn].forEach((b) => {
+      b.style.padding = "6px";
+      b.style.borderRadius = "6px";
+      b.style.border = "none";
+      b.style.background = "#222";
+      b.style.color = "#fff";
+      b.style.marginRight = "4px";
+    });
+
+    const pre = document.createElement("pre");
+    pre.style.background = "#000";
+    pre.style.color = "#0f0";
+    pre.style.padding = "6px";
+    pre.style.overflowX = "auto";
+    pre.style.maxHeight = "300px";
+
+    contentDiv.append(urlInput, fetchBtn, copyBtn, saveBtn, pre);
+
+    fetchBtn.onclick = async () => {
+      const url = urlInput.value.trim();
+      if (!url) return toast("Enter URL");
+      try {
+        const txt = await fetch(url).then((r) => r.text());
+        pre.textContent = txt;
+        toast("Fetched");
+      } catch {
+        toast("Failed");
+      }
+    };
+    copyBtn.onclick = () => {
+      navigator.clipboard.writeText(pre.textContent).then(() => toast("Copied"));
+    };
+    saveBtn.onclick = () => {
+      const code = pre.textContent;
+      if (!code) return toast("No code");
+      const name = "GH_" + Math.floor(Math.random() * 9999);
+      snippets[name] = { name, code, target: "top", mode: "manual" };
+      saveSnippets();
+      toast("Saved snippet: " + name);
+    };
+  }
+
+  /* ================= Tab Switcher ================= */
+  function drawActiveTab() {
+    if (activeTab === "Frames") drawFrameTree();
+    else if (activeTab === "Snippets") drawSnippetsTab();
+    else if (activeTab === "GitHub") drawGitHubTab();
   }
 
   drawActiveTab();
 
-  // MutationObserver for dynamic frames
-  new MutationObserver(()=>{ if(activeTab==="Frames") drawFrameTree(); }).observe(document.body,{childList:true,subtree:true});
+  /* ================= MutationObserver ================= */
+  let moTimer = null;
+  new MutationObserver(() => {
+    if (activeTab !== "Frames") return;
+    clearTimeout(moTimer);
+    moTimer = setTimeout(drawFrameTree, 200);
+  }).observe(document.body, { childList: true, subtree: true });
 
-  // Auto-run start/always snippets on top window
-  window.addEventListener("load",()=>{ Object.values(snippets).forEach(s=>{ if(s.mode==="start"||s.mode==="always") drawSnippetsTab(); }); });
-
+  /* ================= Autorun Snippets ================= */
+  window.addEventListener("load", () => {
+    Object.values(snippets).forEach((s) => {
+      if (s.mode === "start" || s.mode === "always") {
+        injectEvalBridge(window);
+        const frames = collectFrames();
+        if (s.target === "top") execInWindow(window, s.code);
+        else if (s.target === "all")
+          frames.forEach((f) => execInWindow(f.win, s.code));
+        else {
+          const f = frames.find((x) => x.id === s.target);
+          f && execInWindow(f.win, s.code);
+        }
+      }
+    });
+  });
 })();
