@@ -1,0 +1,375 @@
+(() => {
+  "use strict";
+
+  /*************************************************************************
+   * Prevent Double Execution
+   *************************************************************************/
+  if (window.__UNIVERSAL_NETWORK_INTERCEPTOR_LOADED__) return;
+  window.__UNIVERSAL_NETWORK_INTERCEPTOR_LOADED__ = true;
+
+  console.info("[Universal Network Interceptor] Script Loaded");
+
+  /*************************************************************************
+   * Dexie.js Setup for IndexedDB - Logs, Clones and Workflows
+   *************************************************************************/
+  const db = new Dexie("universalNetworkInterceptorDB");
+  db.version(1).stores({
+    logs: "++id,timestamp,type,url", // Logs (requests and responses)
+    clones: "++id,timestamp,request,response", // Cloned requests for replay
+    workflows: "++id,timestamp,steps", // Multi-step workflows
+  });
+
+  db.open().catch((err) => {
+    console.error("[Interceptor IndexedDB] Failed to open database:", err);
+  });
+
+  /*************************************************************************
+   * Centralized Debugging Settings
+   *************************************************************************/
+  let CENTRALIZED_LOGGING_SETTINGS = {
+    webhookURL: "", // Webhook endpoint for real-time log forwarding
+    enabled: false, // Toggles centralized logging on/off
+    retryOnFail: true, // Retry forwarding on failure
+    applyFilters: true, // Enable filters for centralized logs
+  };
+
+  /*************************************************************************
+   * Logging Filters and Global Configuration
+   *************************************************************************/
+  const SETTINGS = {
+    urlPatterns: [], // Filters based on URL patterns (e.g., `api.example.com/*`)
+    methods: ["GET", "POST", "PUT", "DELETE"], // HTTP methods to log
+    protocols: ["fetch", "XHR", "WebSocket"], // Which protocols to log
+    maxLogs: 1000, // Limit logs for optimized performance
+  };
+
+  /*************************************************************************
+   * CentralizedLogger: Handles Webhooks for Real-Time Debugging
+   *************************************************************************/
+  const CentralizedLogger = {
+    async forwardLog(logEntry) {
+      if (!CENTRALIZED_LOGGING_SETTINGS.enabled) return;
+      const { webhookURL } = CENTRALIZED_LOGGING_SETTINGS;
+      if (!webhookURL) return;
+
+      try {
+        const response = await fetch(webhookURL, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(logEntry),
+        });
+        if (!response.ok) throw new Error(`[CentralizedLogging] Failed with status ${response.status}`);
+        console.info("[Centralized Logging] Log forwarded:", logEntry);
+      } catch (err) {
+        console.error("[CentralizedLogging] Error forwarding log:", err);
+        // Implement retry logic for failed deliveries
+        this.retryFailedDelivery(logEntry);
+      }
+    },
+
+    async retryFailedDelivery(logEntry) {
+      if (!CENTRALIZED_LOGGING_SETTINGS.retryOnFail) return;
+
+      let retryCount = 0;
+      let delay = 1000; // Start with 1 second delay
+
+      while (retryCount < 5) {
+        await new Promise((resolve) => setTimeout(resolve, delay));
+        retryCount++;
+        delay *= 2; // Exponential backoff
+
+        try {
+          const result = await fetch(CENTRALIZED_LOGGING_SETTINGS.webhookURL, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify(logEntry),
+          });
+          if (result.ok) {
+            console.info("[Centralized Logging] Successfully retried log forwarding.");
+            return;
+          }
+        } catch (err) {
+          console.error(`[CentralizedLogging Retry ${retryCount}] Forwarding failed, reason:`, err);
+        }
+      }
+      console.error("[CentralizedLogging] Log forwarding permanently failed after retries.");
+    },
+  };
+
+  /*************************************************************************
+   * Interceptor Functions
+   *************************************************************************/
+  const Interceptor = {
+    async logNetworkActivity(type, data) {
+      // Skip logging based on filters
+      if (!this.shouldLog(data)) return;
+
+      const logEntry = {
+        id: uid(),
+        timestamp: nowIso(),
+        type,
+        ...data,
+      };
+
+      try {
+        await db.logs.add(logEntry);
+
+        // Forward to webhook if centralized logging is active
+        if (CENTRALIZED_LOGGING_SETTINGS.enabled) {
+          CentralizedLogger.forwardLog(logEntry);
+        }
+
+        if (UI && UI.currentTab === "logs") {
+          UI.appendLogEntry(logEntry); // Dynamically update logs on UI if visible
+        }
+      } catch (err) {
+        console.error("[Logging Error] Failed to log request:", err);
+      }
+    },
+
+    /* Filter URLs, methods, and protocols for which logs will be recorded */
+    shouldLog(data) {
+      // (a) Filter by protocol
+      const protocolMatch = SETTINGS.protocols.includes(data.protocol || "unknown");
+      if (!protocolMatch) return false;
+
+      // (b) Apply URL filters if configured
+      if (SETTINGS.urlPatterns.length > 0) {
+        const urlMatched = SETTINGS.urlPatterns.some((pattern) => new RegExp(pattern.replace("*", ".*")).test(data.url));
+        if (!urlMatched) return false;
+      }
+
+      // (c) Filter methods
+      if (data.method && !SETTINGS.methods.includes(data.method.toUpperCase())) {
+        return false;
+      }
+
+      return true;
+    },
+
+        /* Hooks for fetch() */
+    hookFetch() {
+      const originalFetch = window.fetch;
+
+      window.fetch = async function (url, options = {}) {
+        const requestMeta = {
+          protocol: "fetch",
+          method: options.method || "GET",
+          url,
+          headers: options.headers || {},
+          body: options.body || null,
+          timestamp: nowIso(),
+        };
+
+        // Log the request
+        Interceptor.logNetworkActivity("Fetch Request", requestMeta);
+
+        try {
+          const response = await originalFetch(url, options);
+          const clonedResponse = response.clone(); // Clone response for logging
+          const responseMeta = {
+            protocol: "fetch",
+            url,
+            status: clonedResponse.status,
+            headers: Object.fromEntries(clonedResponse.headers.entries()),
+            body: await lazyBlobToBase64(await clonedResponse.blob()),
+          };
+
+          // Log the response
+          Interceptor.logNetworkActivity("Fetch Response", { request: requestMeta, response: responseMeta });
+          return response; // Return the original response to the caller
+        } catch (error) {
+          console.error("[Fetch Interceptor Error]:", error);
+          throw error; // Ensure errors are propagated to the original caller
+        }
+      };
+    },
+
+    /* Hooks for XMLHttpRequest (XHR) */
+    hookXHR() {
+      const OriginalXHR = window.XMLHttpRequest;
+
+      window.XMLHttpRequest = function () {
+        const xhr = new OriginalXHR();
+        const requestMeta = { protocol: "XHR", method: null, url: null, headers: {}, body: null };
+
+        xhr.open = function (method, url) {
+          requestMeta.method = method;
+          requestMeta.url = url;
+          OriginalXHR.prototype.open.apply(this, arguments);
+        };
+
+        xhr.setRequestHeader = function (header, value) {
+          requestMeta.headers[header] = value;
+          OriginalXHR.prototype.setRequestHeader.apply(this, arguments);
+        };
+
+        xhr.send = function (body) {
+          requestMeta.body = body || null;
+          Interceptor.logNetworkActivity("XHR Request", requestMeta);
+
+          this.addEventListener("load", function () {
+            const responseMeta = {
+              protocol: "XHR",
+              url: requestMeta.url,
+              status: xhr.status,
+              headers: xhr.getAllResponseHeaders(),
+              body: xhr.responseText,
+            };
+
+            Interceptor.logNetworkActivity("XHR Response", { request: requestMeta, response: responseMeta });
+          });
+
+          OriginalXHR.prototype.send.apply(this, arguments);
+        };
+
+        return xhr;
+      };
+    },
+
+    /* Hooks for WebSocket */
+    hookWebSocket() {
+      const OriginalWebSocket = window.WebSocket;
+
+      window.WebSocket = function (url, protocols) {
+        const ws = protocols ? new OriginalWebSocket(url, protocols) : new OriginalWebSocket(url);
+
+        ws.addEventListener("message", (event) => {
+          Interceptor.logNetworkActivity("WebSocket Message Received", {
+            protocol: "WebSocket",
+            url,
+            payload: event.data,
+            timestamp: nowIso(),
+          });
+        });
+
+        const originalSend = ws.send;
+        ws.send = function (data) {
+          Interceptor.logNetworkActivity("WebSocket Message Sent", {
+            protocol: "WebSocket",
+            url,
+            payload: data,
+            timestamp: nowIso(),
+          });
+          originalSend.call(ws, data);
+        };
+
+        return ws;
+      };
+    },
+  };
+
+  /*************************************************************************
+   * Enhance Replay Functionality for Requests
+   *************************************************************************/
+  const ReplayManager = {
+    async replayRequest(requestMeta, responseMeta = null) {
+      const requestOptions = {
+        method: requestMeta.method,
+        headers: requestMeta.headers,
+        body: requestMeta.body,
+      };
+
+      try {
+        const response = await fetch(requestMeta.url, requestOptions);
+        const responseBody = await response.text();
+
+        console.info(`[ReplayManager] Replay Successful!`, {
+          request: requestMeta,
+          response: {
+            status: response.status,
+            headers: Object.fromEntries(response.headers.entries()),
+            body: responseBody,
+          },
+        });
+        alert("Replay Successful! Check the console for details.");
+      } catch (err) {
+        console.error("[ReplayManager] Replay Failed!", err);
+        alert("Replay Failed! Check the console for error details.");
+      }
+    },
+
+    replayWebSocketMessage(message, url) {
+      const ws = new WebSocket(url);
+      ws.addEventListener("open", () => {
+        ws.send(message);
+        console.info("[ReplayWebSocket] Message successfully replayed:", { message, url });
+        alert("WebSocket Message Replay Successful!");
+      });
+    },
+  };
+
+  /*************************************************************************
+   * Lazy Loading and Paginated Logs in the UI
+   *************************************************************************/
+  const UI = {
+    currentPage: 0,
+    pageSize: 25,
+
+    async showLogsTab() {
+      const logs = await db.logs
+        .orderBy("timestamp")
+        .reverse()
+        .offset(this.currentPage * this.pageSize)
+        .limit(this.pageSize)
+        .toArray();
+
+      this.contentArea.innerHTML = "<h3>Request Logs</h3>";
+
+      if (logs.length === 0) {
+        this.contentArea.innerHTML += "<p>No logs available.</p>";
+        return;
+      }
+
+      logs.forEach((log) => this.appendLogToUI(log));
+
+      const totalLogs = await db.logs.count();
+      if ((this.currentPage + 1) * this.pageSize < totalLogs) {
+        const loadMoreBtn = document.createElement("button");
+        loadMoreBtn.textContent = "Load More Logs";
+        loadMoreBtn.onclick = () => {
+          this.currentPage += 1;
+          this.showLogsTab();
+        };
+        this.contentArea.appendChild(loadMoreBtn);
+      }
+    },
+
+    appendLogToUI(log) {
+      const logElem = document.createElement("div");
+      logElem.style.cssText = `
+        margin-bottom: 10px;
+        padding: 10px;
+        border: 1px solid #ccc;
+        background: #f4f4f4;
+      `;
+
+      if (log.data?.response?.status >= 400) {
+        logElem.style.borderColor = "red";
+      }
+
+      logElem.innerHTML = `
+        <strong>${log.type}</strong>: ${log.url || "N/A"}
+        <pre>${JSON.stringify(log, null, 2)}</pre>
+      `;
+
+      this.contentArea.appendChild(logElem);
+    },
+  };
+
+  /*************************************************************************
+   * Initialize Interceptors and UI
+   *************************************************************************/
+  (() => {
+    // Initialize hooks
+    Interceptor.hookFetch();
+    Interceptor.hookXHR();
+    Interceptor.hookWebSocket();
+
+    console.info("[Universal Network Interceptor] Fully Initialized!");
+  })();
+})();
