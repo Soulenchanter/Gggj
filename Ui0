@@ -1,456 +1,272 @@
+// ==UserScript==
+// @name         Universal Network Interceptor (All-Inclusive)
+// @namespace    https://example.local/
+// @version      6.0.0
+// @description  All-in-one network interceptor: fetch/XHR/WS/STOMP chaining, cloning, replaying, robust editing, and iframe-aware UI overlay.
+// @match        *://*/*
+// @grant        none
+// @run-at       document-start
+// ==/UserScript==
+
 (() => {
   "use strict";
 
-  const STORAGE_SNIPPETS = "mcc_snippets_v4";
-  const STORAGE_BTN = "mcc_button_pos_v4";
+  /**************************************************************************
+   * Prevent Double Load
+   **************************************************************************/
+  if (window.__UNIVERSAL_NETWORK_INTERCEPTOR_LOADED__) return;
+  window.__UNIVERSAL_NETWORK_INTERCEPTOR_LOADED__ = true;
 
-  let snippets = JSON.parse(localStorage.getItem(STORAGE_SNIPPETS) || "{}");
-  const saveSnippets = () =>
-    localStorage.setItem(STORAGE_SNIPPETS, JSON.stringify(snippets));
+  /**************************************************************************
+   * Core Configuration
+   **************************************************************************/
+  const STORAGE = {
+    CLONES: "uni_ni_clones",
+    LOGS: "uni_ni_logs",
+  };
 
-  /* ================= Toast ================= */
-  function toast(msg, timeout = 3000) {
-    let t = document.getElementById("mcc_toast");
-    if (!t) {
-      t = document.createElement("div");
-      t.id = "mcc_toast";
-      Object.assign(t.style, {
-        position: "fixed",
-        left: "50%",
-        bottom: "80px",
-        transform: "translateX(-50%)",
-        background: "#222",
-        color: "#fff",
-        padding: "10px 14px",
-        borderRadius: "8px",
-        zIndex: 9999999,
-        fontFamily: "system-ui,monospace",
-        fontSize: "13px",
-        opacity: 0,
-        transition: "opacity 0.3s",
-      });
-      document.body.appendChild(t);
-    }
-    t.textContent = msg;
-    t.style.opacity = "1";
-    clearTimeout(t._to);
-    t._to = setTimeout(() => (t.style.opacity = "0"), timeout);
+  const DEFAULTS = {
+    maxLogs: 5000,
+    maxClones: 500,
+  };
+
+  let LOGS = loadJSON(STORAGE.LOGS, []);
+  let CLONES = loadJSON(STORAGE.CLONES, []);
+
+  /**************************************************************************
+   * Utilities
+   **************************************************************************/
+  function nowIso() {
+    return new Date().toISOString();
   }
 
-  /* ================= Floating Button ================= */
-  const floatBtn = document.createElement("button");
-  floatBtn.textContent = "≡";
-  Object.assign(floatBtn.style, {
-    position: "fixed",
-    top: "40px",
-    left: "10px",
-    width: "56px",
-    height: "56px",
-    borderRadius: "50%",
-    background: "#1e1e1e",
-    color: "#fff",
-    fontSize: "26px",
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    boxShadow: "0 6px 18px rgba(0,0,0,0.6)",
-    border: "none",
-    cursor: "pointer",
-    zIndex: 9999998,
-    touchAction: "none",
-  });
-  document.body.appendChild(floatBtn);
+  function uid() {
+    return Math.random().toString(36).slice(2, 9);
+  }
 
-  try {
-    const pos = JSON.parse(localStorage.getItem(STORAGE_BTN));
-    if (pos) {
-      floatBtn.style.left = pos.left;
-      floatBtn.style.top = pos.top;
+  function loadJSON(key, fallback) {
+    try {
+      return JSON.parse(localStorage.getItem(key)) || fallback;
+    } catch (e) {
+      return fallback;
     }
-  } catch {}
+  }
 
-  (() => {
-    let dragging = false,
-      sx = 0,
-      sy = 0,
-      sl = 0,
-      st = 0;
-    floatBtn.addEventListener("pointerdown", (e) => {
-      dragging = true;
-      sx = e.clientX;
-      sy = e.clientY;
-      sl = floatBtn.offsetLeft;
-      st = floatBtn.offsetTop;
-      floatBtn.setPointerCapture(e.pointerId);
-    });
-    floatBtn.addEventListener("pointermove", (e) => {
-      if (!dragging) return;
-      floatBtn.style.left = Math.max(4, sl + (e.clientX - sx)) + "px";
-      floatBtn.style.top = Math.max(4, st + (e.clientY - sy)) + "px";
-    });
-    floatBtn.addEventListener("pointerup", (e) => {
-      dragging = false;
-      floatBtn.releasePointerCapture(e.pointerId);
-      localStorage.setItem(
-        STORAGE_BTN,
-        JSON.stringify({ left: floatBtn.style.left, top: floatBtn.style.top })
-      );
-    });
-  })();
+  function saveJSON(key, value) {
+    localStorage.setItem(key, JSON.stringify(value));
+  }
 
-  /* ================= Panel ================= */
-  const panel = document.createElement("div");
-  Object.assign(panel.style, {
-    position: "fixed",
-    right: "-100%",
-    top: "0",
-    width: "90%",
-    height: "100%",
-    background: "#111",
-    color: "#fff",
-    zIndex: 9999997,
-    boxShadow: "0 0 30px rgba(0,0,0,0.7)",
-    transition: "right 0.25s",
-    display: "flex",
-    flexDirection: "column",
-    fontFamily: "monospace",
-  });
-  document.body.appendChild(panel);
+  function safeClone(obj) {
+    return JSON.parse(JSON.stringify(obj));
+  }
 
-  let panelOpen = false;
-  floatBtn.onclick = () => {
-    panelOpen = !panelOpen;
-    panel.style.right = panelOpen ? "0" : "-100%";
+  function pushLog(type, source, meta = {}) {
+    const logEntry = { id: uid(), ts: nowIso(), type, source, meta };
+    LOGS.push(logEntry);
+    if (LOGS.length > DEFAULTS.maxLogs) LOGS.shift();
+    saveJSON(STORAGE.LOGS, LOGS);
+    console.debug("[Interceptor Log]", logEntry);
+  }
+
+  function addClone(clone) {
+    if (!clone.id) clone.id = uid();
+    CLONES.unshift(clone);
+    if (CLONES.length > DEFAULTS.maxClones) CLONES.pop();
+    saveJSON(STORAGE.CLONES, CLONES);
+  }
+
+  /**************************************************************************
+   * Overlay UI: Logs and Clones Management
+   **************************************************************************/
+  const UI = {
+    overlay: null,
+    currentTab: "Logs",
+    createOverlay() {
+      const el = document.createElement("div");
+      el.id = "ni-overlay";
+
+      // UI Styles
+      el.style.position = "fixed";
+      el.style.bottom = "12px";
+      el.style.right = "12px";
+      el.style.width = "400px";
+      el.style.height = "600px";
+      el.style.zIndex = "999999999";
+      el.style.background = "white";
+      el.style.border = "1px solid black";
+      el.style.overflow = "auto";
+
+      document.body.appendChild(el);
+      this.overlay = el;
+
+      // Render the logs UI by default
+      this.renderLogs();
+    },
+    renderLogs() {
+      if (!this.overlay) this.createOverlay();
+
+      this.overlay.innerHTML = "<h3>Logs</h3><ul>";
+      LOGS.forEach((log) => {
+        this.overlay.innerHTML += `<li>${log.ts} - ${log.type} - ${log.source}</li>`;
+      });
+      this.overlay.innerHTML += "</ul>";
+    },
+    renderClones() {
+      if (!this.overlay) this.createOverlay();
+
+      this.overlay.innerHTML = `<h3>Clones</h3>`;
+      this.overlay.innerHTML += CLONES.map((clone) => `<div>${clone.request?.url || "Unknown URL"} [${clone.request?.kind || "Unknown"}]</div>`).join("");
+    },
+    switchToTab(tabName) {
+      this.currentTab = tabName;
+      if (tabName === "Logs") {
+        this.renderLogs();
+      } else if (tabName === "Clones") {
+        this.renderClones();
+      }
+    },
   };
 
-  const header = document.createElement("div");
-  Object.assign(header.style, {
-    display: "flex",
-    justifyContent: "space-between",
-    alignItems: "center",
-    padding: "12px",
-    background: "#151515",
-    borderBottom: "1px solid #222",
-  });
-  const htitle = document.createElement("div");
-  htitle.textContent = "Mini DevTools+";
-  const hclose = document.createElement("button");
-  hclose.textContent = "✕";
-  Object.assign(hclose.style, {
-    background: "#222",
-    color: "#fff",
-    border: "none",
-    padding: "6px 12px",
-    borderRadius: "6px",
-    cursor: "pointer",
-  });
-  hclose.onclick = () => {
-    panelOpen = false;
-    panel.style.right = "-100%";
-  };
-  header.appendChild(htitle);
-  header.appendChild(hclose);
-  panel.appendChild(header);
-
-  /* ================= Tabs ================= */
-  const tabsDiv = document.createElement("div");
-  Object.assign(tabsDiv.style, {
-    display: "flex",
-    gap: "4px",
-    padding: "6px",
-    background: "#000",
-  });
-  const tabNames = ["Snippets", "Frames", "GitHub"];
-  let activeTab = "Snippets";
-  const tabButtons = {};
-  tabNames.forEach((name) => {
-    const b = document.createElement("button");
-    b.textContent = name;
-    Object.assign(b.style, {
-      flex: "1",
-      padding: "6px",
-      background: "#222",
-      color: "#fff",
-      border: "none",
-      borderRadius: "4px",
-    });
-    b.onclick = () => {
-      activeTab = name;
-      drawActiveTab();
+  /**************************************************************************
+   * Request/Response Chaining and Cloning
+   **************************************************************************/
+  function createClone(request, response, linkedTo = null) {
+    const cloneEntry = {
+      id: uid(),
+      ts: nowIso(),
+      request: safeClone(request),
+      response: safeClone(response),
+      linkedTo: linkedTo || null, // ID of the linked clone
     };
-    tabsDiv.appendChild(b);
-    tabButtons[name] = b;
-  });
-  panel.appendChild(tabsDiv);
 
-  const contentDiv = document.createElement("div");
-  Object.assign(contentDiv.style, {
-    flex: "1",
-    overflow: "auto",
-    padding: "8px",
-  });
-  panel.appendChild(contentDiv);
-
-  /* ================= Frame Collector ================= */
-  function collectFrames(win = window, parentId = "top", depth = 0, out = []) {
-    if (!win || !win.document) return out;
-    out.push({ id: parentId, win, depth });
-
-    const iframes = win.document.querySelectorAll("iframe");
-    iframes.forEach((f, i) => {
-      const fid = parentId + "_f" + i;
-      try {
-        const w = f.contentWindow;
-        void w.location.href;
-        collectFrames(w, fid, depth + 1, out);
-      } catch {
-        out.push({ id: fid, win: null, depth: depth + 1 });
-      }
-    });
-    return out;
+    addClone(cloneEntry);
+    pushLog("clone", "Created Clone", { request, response });
+    return cloneEntry;
   }
 
-  function drawFrameTree() {
-    contentDiv.innerHTML = "";
-    const tree = collectFrames();
-    tree.forEach((f) => {
-      const div = document.createElement("div");
-      div.style.marginLeft = f.depth * 14 + "px";
-      div.textContent =
-        f.id + (f.win ? "" : " [cross-origin/no-access]");
-      contentDiv.appendChild(div);
-    });
-  }
-
-  /* ================= Eval Bridge ================= */
-  function injectEvalBridge(win) {
-    try {
-      if (!win || win.__MCC_BRIDGE__) return;
-      win.__MCC_BRIDGE__ = true;
-      win.addEventListener("message", (e) => {
-        if (!e.data || !e.data.__MCC_EVAL__) return;
-        try {
-          win.eval(e.data.code);
-        } catch (err) {
-          console.error("[MCC eval error]", err);
-        }
-      });
-    } catch {}
-  }
-  injectEvalBridge(window);
-
-  function execInWindow(win, code) {
-    if (!win) return false;
-    try {
-      win.eval(code);
-      return true;
-    } catch {
-      try {
-        win.postMessage({ __MCC_EVAL__: true, code }, "*");
-        return true;
-      } catch {
-        return false;
-      }
-    }
-  }
-
-  /* ================= Snippets Tab ================= */
-  function drawSnippetsTab() {
-    contentDiv.innerHTML = "";
-
-    const editor = document.createElement("div");
-    editor.style.display = "flex";
-    editor.style.flexDirection = "column";
-    editor.style.gap = "6px";
-
-    const nameInput = document.createElement("input");
-    nameInput.placeholder = "Snippet Name";
-    nameInput.style.padding = "6px";
-
-    const codeArea = document.createElement("textarea");
-    codeArea.rows = 8;
-    codeArea.placeholder = "// JS Code";
-    codeArea.style.padding = "6px";
-
-    const targetSelect = document.createElement("select");
-    targetSelect.style.padding = "6px";
-    targetSelect.multiple = true;
-    targetSelect.size = 6;
-
-    const modeSelect = document.createElement("select");
-    ["manual", "start", "always"].forEach((m) => {
-      const o = document.createElement("option");
-      o.value = m;
-      o.textContent = m;
-      modeSelect.appendChild(o);
-    });
-
-    const saveBtn = document.createElement("button");
-    saveBtn.textContent = "Save + Run";
-
-    const delBtn = document.createElement("button");
-    delBtn.textContent = "Delete";
-
-    [saveBtn, delBtn].forEach((b) => {
-      b.style.padding = "6px";
-      b.style.borderRadius = "6px";
-      b.style.border = "none";
-      b.style.background = "#222";
-      b.style.color = "#fff";
-      editor.appendChild(b);
-    });
-
-    editor.appendChild(nameInput);
-    editor.appendChild(codeArea);
-    editor.appendChild(targetSelect);
-    editor.appendChild(modeSelect);
-    contentDiv.appendChild(editor);
-
-    function refreshTargets() {
-      const frames = collectFrames();
-      targetSelect.innerHTML = "";
-      frames.forEach((f) => {
-        const opt = document.createElement("option");
-        opt.value = f.id;
-        opt.textContent = f.id + (f.win ? "" : " [no-access]");
-        if (!f.win) opt.disabled = true;
-        targetSelect.appendChild(opt);
-      });
-    }
-    refreshTargets();
-
-    function runSnippetByIds(s) {
-      const frames = collectFrames();
-      const selectedIds = Array.from(targetSelect.selectedOptions).map(
-        (o) => o.value
-      );
-      if (!selectedIds.length) selectedIds.push("top"); // fallback top
-      let ran = 0;
-
-      selectedIds.forEach((tid) => {
-        if (tid === "top") ran += execInWindow(window, s.code) ? 1 : 0;
-        else {
-          const f = frames.find((x) => x.id === tid);
-          if (f) ran += execInWindow(f.win, s.code) ? 1 : 0;
-        }
-      });
-      toast(`Snippet ran in ${ran} frame(s)`);
+  function replayClone(cloneId) {
+    const clone = CLONES.find((c) => c.id === cloneId);
+    if (!clone) {
+      console.error(`Clone with ID ${cloneId} not found.`);
+      return;
     }
 
-    saveBtn.onclick = () => {
-      const n = nameInput.value.trim();
-      if (!n) return toast("Provide name");
-      snippets[n] = {
-        name: n,
-        code: codeArea.value,
-        target: Array.from(targetSelect.selectedOptions).map((o) => o.value),
-        mode: modeSelect.value,
+    const { request } = clone;
+
+    // Replay Fetch
+    if (request.kind === "fetch") {
+      pushLog("replay", "Replaying Fetch Clone", request);
+      return window.fetch(request.url, request.options);
+    }
+
+    // Replay XHR
+    if (request.kind === "xhr") {
+      const xhr = new XMLHttpRequest();
+      xhr.open(request.method, request.url, true);
+
+      Object.keys(request.headers || {}).forEach((header) => xhr.setRequestHeader(header, request.headers[header]));
+
+      xhr.onload = () => pushLog("replay", "XHR Response", { status: xhr.status, response: xhr.responseText });
+      xhr.send(request.body || null);
+      pushLog("replay", "Replayed XHR Request", request);
+      return;
+    }
+
+    console.warn("Unsupported request type in replay:", request.kind);
+  }
+
+  function linkResponseToNextRequest(triggerResponse, nextRequestTemplate) {
+    const linkedRequest = safeClone(nextRequestTemplate);
+
+    // Insert dynamic authorization headers or tokens from the response
+    if (triggerResponse.headers && triggerResponse.headers["Authorization"]) {
+      linkedRequest.headers = linkedRequest.headers || {};
+      linkedRequest.headers["Authorization"] = triggerResponse.headers["Authorization"];
+    }
+
+    return linkedRequest;
+  }
+
+  /**************************************************************************
+   * Network Interception: Fetch, XHR, WebSocket
+   **************************************************************************/
+  const NetworkInterceptor = {
+    interceptFetch() {
+      const originalFetch = window.fetch;
+
+      window.fetch = async function (url, options) {
+        const requestMeta = { kind: "fetch", url, options };
+        pushLog("log", "Fetch Sent", requestMeta);
+
+        const response = await originalFetch(url, options);
+        const clonedResponse = response.clone();
+
+        const responseMeta = {
+          status: clonedResponse.status,
+          headers: Array.from(clonedResponse.headers.entries()),
+          body: await clonedResponse.text(),
+        };
+
+        pushLog("log", "Fetch Response", responseMeta);
+        createClone(requestMeta, responseMeta);
+
+        return response; // Forward original response to the application
       };
-      saveSnippets();
-      runSnippetByIds(snippets[n]);
-      refreshTargets();
-    };
+    },
 
-    delBtn.onclick = () => {
-      const n = nameInput.value.trim();
-      if (snippets[n]) {
-        delete snippets[n];
-        saveSnippets();
-        toast("Deleted");
-        refreshTargets();
-      } else toast("Not found");
-    };
-  }
+    interceptXHR() {
+      const OriginalXHR = window.XMLHttpRequest;
 
-  /* ================= GitHub Loader ================= */
-  function drawGitHubTab() {
-    contentDiv.innerHTML = "";
-    const urlInput = document.createElement("input");
-    urlInput.placeholder = "GitHub Raw URL";
-    urlInput.style.width = "100%";
-    urlInput.style.padding = "6px";
+      function EnhancedXHR() {
+        const xhr = new OriginalXHR();
+        const requestMeta = { kind: "xhr" };
 
-    const fetchBtn = document.createElement("button");
-    fetchBtn.textContent = "Fetch";
-    const copyBtn = document.createElement("button");
-    copyBtn.textContent = "Copy";
-    const saveBtn = document.createElement("button");
-    saveBtn.textContent = "Save as Snippet";
+        xhr.open = (method, url, async = true) => {
+          requestMeta.method = method;
+          requestMeta.url = url;
+          return OriginalXHR.prototype.open.apply(xhr, arguments);
+        };
 
-    [fetchBtn, copyBtn, saveBtn].forEach((b) => {
-      b.style.padding = "6px";
-      b.style.borderRadius = "6px";
-      b.style.border = "none";
-      b.style.background = "#222";
-      b.style.color = "#fff";
-      b.style.marginRight = "4px";
-    });
+        xhr.setRequestHeader = (header, value) => {
+          requestMeta.headers = requestMeta.headers || {};
+          requestMeta.headers[header] = value;
+          return OriginalXHR.prototype.setRequestHeader.apply(xhr, arguments);
+        };
 
-    const pre = document.createElement("pre");
-    pre.style.background = "#000";
-    pre.style.color = "#0f0";
-    pre.style.padding = "6px";
-    pre.style.overflowX = "auto";
-    pre.style.maxHeight = "300px";
+        xhr.onreadystatechange = () => {
+          if (xhr.readyState === 4) {
+            const responseMeta = {
+              status: xhr.status,
+              responseText: xhr.responseText,
+              headers: xhr.getAllResponseHeaders(),
+            };
 
-    contentDiv.append(urlInput, fetchBtn, copyBtn, saveBtn, pre);
-
-    fetchBtn.onclick = async () => {
-      const url = urlInput.value.trim();
-      if (!url) return toast("Enter URL");
-      try {
-        const txt = await fetch(url).then((r) => r.text());
-        pre.textContent = txt;
-        toast("Fetched");
-      } catch {
-        toast("Failed");
-      }
-    };
-    copyBtn.onclick = () => {
-      navigator.clipboard.writeText(pre.textContent).then(() => toast("Copied"));
-    };
-    saveBtn.onclick = () => {
-      const code = pre.textContent;
-      if (!code) return toast("No code");
-      const name = "GH_" + Math.floor(Math.random() * 9999);
-      snippets[name] = { name, code, target: ["top"], mode: "manual" };
-      saveSnippets();
-      toast("Saved snippet: " + name);
-    };
-  }
-
-  /* ================= Tab Switcher ================= */
-  function drawActiveTab() {
-    if (activeTab === "Frames") drawFrameTree();
-    else if (activeTab === "Snippets") drawSnippetsTab();
-    else if (activeTab === "GitHub") drawGitHubTab();
-  }
-
-  drawActiveTab();
-
-  /* ================= MutationObserver ================= */
-  let moTimer = null;
-  new MutationObserver(() => {
-    if (activeTab !== "Frames") return;
-    clearTimeout(moTimer);
-    moTimer = setTimeout(drawFrameTree, 200);
-  }).observe(document.body, { childList: true, subtree: true });
-
-  /* ================= Autorun Snippets ================= */
-  window.addEventListener("load", () => {
-    Object.values(snippets).forEach((s) => {
-      if (s.mode === "start" || s.mode === "always") {
-        injectEvalBridge(window);
-        const frames = collectFrames();
-        const targets = Array.isArray(s.target) ? s.target : [s.target];
-        targets.forEach((tid) => {
-          if (tid === "top") execInWindow(window, s.code);
-          else {
-            const f = frames.find((x) => x.id === tid);
-            f && execInWindow(f.win, s.code);
+            pushLog("log", "XHR Response", responseMeta);
+            createClone(requestMeta, responseMeta);
           }
-        });
+        };
+
+        xhr.send = (body) => {
+          requestMeta.body = body || null;
+          pushLog("log", "XHR Sent", requestMeta);
+          return OriginalXHR.prototype.send.apply(xhr, arguments);
+        };
+
+        return xhr;
       }
-    });
-  });
+
+      window.XMLHttpRequest = EnhancedXHR;
+    },
+
+    apply() {
+      this.interceptFetch();
+      this.interceptXHR();
+    },
+  };
+
+  /**************************************************************************
+   * Initialization
+   **************************************************************************/
+  NetworkInterceptor.apply();
+  UI.createOverlay(); // Create default UI overlay for logs/clones
 })();
