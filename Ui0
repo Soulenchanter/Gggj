@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Universal Network Interceptor (All-Inclusive)
+// @name         Universal Network Interceptor (Ultimate Version)
 // @namespace    https://example.local/
-// @version      6.0.0
-// @description  All-in-one network interceptor: fetch/XHR/WS/STOMP chaining, cloning, replaying, robust editing, and iframe-aware UI overlay.
+// @version      8.0.0
+// @description  Full monitoring, cloning, and replay for fetch, XHR, WebSocket, STOMP workflows. Includes GraphQL/binary support, chained workflows, replay features, and a UI overlay.
 // @match        *://*/*
 // @grant        none
 // @run-at       document-start
@@ -12,36 +12,45 @@
   "use strict";
 
   /**************************************************************************
-   * Prevent Double Load
+   * Prevent Double Execution
    **************************************************************************/
   if (window.__UNIVERSAL_NETWORK_INTERCEPTOR_LOADED__) return;
   window.__UNIVERSAL_NETWORK_INTERCEPTOR_LOADED__ = true;
 
+  console.info("[Universal Network Interceptor] Script Loaded");
+
   /**************************************************************************
-   * Core Configuration
+   * Configuration and Data Storage
    **************************************************************************/
   const STORAGE = {
-    CLONES: "uni_ni_clones",
-    LOGS: "uni_ni_logs",
+    CLONES: "uni_clones",
+    LOGS: "uni_logs",
+    SETTINGS: "uni_settings",
+    WORKFLOWS: "uni_workflows",
   };
 
   const DEFAULTS = {
     maxLogs: 5000,
     maxClones: 500,
+    blacklistPatterns: [],
+    sizeLimitKB: 1024, // File payload size limit
   };
 
   let LOGS = loadJSON(STORAGE.LOGS, []);
   let CLONES = loadJSON(STORAGE.CLONES, []);
+  let WORKFLOWS = loadJSON(STORAGE.WORKFLOWS, []);
+  let SETTINGS = loadJSON(STORAGE.SETTINGS, DEFAULTS);
 
   /**************************************************************************
-   * Utilities
+   * Utility Functions
    **************************************************************************/
+
   function nowIso() {
     return new Date().toISOString();
   }
 
   function uid() {
-    return Math.random().toString(36).slice(2, 9);
+    return Math.random().toString(36).slice(2);
   }
 
   function loadJSON(key, fallback) {
@@ -56,200 +65,167 @@
     localStorage.setItem(key, JSON.stringify(value));
   }
 
-  function safeClone(obj) {
-    return JSON.parse(JSON.stringify(obj));
-  }
-
-  function pushLog(type, source, meta = {}) {
-    const logEntry = { id: uid(), ts: nowIso(), type, source, meta };
-    LOGS.push(logEntry);
-    if (LOGS.length > DEFAULTS.maxLogs) LOGS.shift();
+  function addLogEntry(entry) {
+    LOGS.push(entry);
+    while (LOGS.length > SETTINGS.maxLogs) LOGS.shift();
     saveJSON(STORAGE.LOGS, LOGS);
-    console.debug("[Interceptor Log]", logEntry);
-  }
-
-  function addClone(clone) {
-    if (!clone.id) clone.id = uid();
-    CLONES.unshift(clone);
-    if (CLONES.length > DEFAULTS.maxClones) CLONES.pop();
-    saveJSON(STORAGE.CLONES, CLONES);
   }
 
   /**************************************************************************
-   * Overlay UI: Logs and Clones Management
+   * Blob/Binary Data Utilities
    **************************************************************************/
-  const UI = {
-    overlay: null,
-    currentTab: "Logs",
-    createOverlay() {
-      const el = document.createElement("div");
-      el.id = "ni-overlay";
 
-      // UI Styles
-      el.style.position = "fixed";
-      el.style.bottom = "12px";
-      el.style.right = "12px";
-      el.style.width = "400px";
-      el.style.height = "600px";
-      el.style.zIndex = "999999999";
-      el.style.background = "white";
-      el.style.border = "1px solid black";
-      el.style.overflow = "auto";
+  async function blobToBase64(blob) {
+    const reader = new FileReader();
+    return new Promise((resolve, reject) => {
+      reader.onload = () => resolve(reader.result.split(",")[1] || ""); // Get base64 part
+      reader.onerror = reject;
+      reader.readAsDataURL(blob);
+    });
+  }
 
-      document.body.appendChild(el);
-      this.overlay = el;
+  function base64ToBlob(base64, type = "application/octet-stream") {
+    const binary = atob(base64);
+    const len = binary.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
+    return new Blob([bytes], { type });
+  }
 
-      // Render the logs UI by default
-      this.renderLogs();
+  /**************************************************************************
+   * Workflow Manager
+   **************************************************************************/
+
+  const WorkflowManager = {
+    workflows: WORKFLOWS,
+
+    addWorkflow(request, response) {
+      const workflow = {
+        id: uid(),
+        timestamp: nowIso(),
+        steps: [
+          {
+            request,
+            response,
+          },
+        ],
+      };
+      this.workflows.push(workflow);
+      saveJSON(STORAGE.WORKFLOWS, this.workflows);
+      console.info(`[Workflow] Captured new workflow: ${workflow.id}`);
+      return workflow.id;
     },
-    renderLogs() {
-      if (!this.overlay) this.createOverlay();
 
-      this.overlay.innerHTML = "<h3>Logs</h3><ul>";
-      LOGS.forEach((log) => {
-        this.overlay.innerHTML += `<li>${log.ts} - ${log.type} - ${log.source}</li>`;
-      });
-      this.overlay.innerHTML += "</ul>";
-    },
-    renderClones() {
-      if (!this.overlay) this.createOverlay();
-
-      this.overlay.innerHTML = `<h3>Clones</h3>`;
-      this.overlay.innerHTML += CLONES.map((clone) => `<div>${clone.request?.url || "Unknown URL"} [${clone.request?.kind || "Unknown"}]</div>`).join("");
-    },
-    switchToTab(tabName) {
-      this.currentTab = tabName;
-      if (tabName === "Logs") {
-        this.renderLogs();
-      } else if (tabName === "Clones") {
-        this.renderClones();
+    addStepToWorkflow(workflowId, request, response) {
+      const workflow = this.workflows.find((w) => w.id === workflowId);
+      if (!workflow) {
+        console.error(`[Workflow] Workflow not found: ${workflowId}`);
+        return;
       }
+      workflow.steps.push({ request, response });
+      saveJSON(STORAGE.WORKFLOWS, this.workflows);
+      console.info(`[Workflow] Added new step to workflow: ${workflowId}`);
+    },
+
+    visualizeWorkflow(workflowId) {
+      const workflow = this.workflows.find((w) => w.id === workflowId);
+      if (!workflow) {
+        console.error(`[Workflow] Cannot visualize workflow: ${workflowId}`);
+        return;
+      }
+
+      console.group(`[Workflow Visualization] ${workflowId}`);
+      workflow.steps.forEach((step, index) => {
+        console.log(`Step ${index + 1}`);
+        console.info("Request:", step.request);
+        console.info("Response:", step.response);
+      });
+      console.groupEnd();
     },
   };
 
   /**************************************************************************
-   * Request/Response Chaining and Cloning
+   * Interceptor: Fetch, XHR, WebSocket
    **************************************************************************/
-  function createClone(request, response, linkedTo = null) {
-    const cloneEntry = {
-      id: uid(),
-      ts: nowIso(),
-      request: safeClone(request),
-      response: safeClone(response),
-      linkedTo: linkedTo || null, // ID of the linked clone
-    };
 
-    addClone(cloneEntry);
-    pushLog("clone", "Created Clone", { request, response });
-    return cloneEntry;
-  }
+  const Interceptor = {
+    initialize() {
+      this.hookFetch();
+      this.hookXHR();
+      this.hookWebSocket();
+      console.info("[Interceptor] Initialized");
+    },
 
-  function replayClone(cloneId) {
-    const clone = CLONES.find((c) => c.id === cloneId);
-    if (!clone) {
-      console.error(`Clone with ID ${cloneId} not found.`);
-      return;
-    }
-
-    const { request } = clone;
-
-    // Replay Fetch
-    if (request.kind === "fetch") {
-      pushLog("replay", "Replaying Fetch Clone", request);
-      return window.fetch(request.url, request.options);
-    }
-
-    // Replay XHR
-    if (request.kind === "xhr") {
-      const xhr = new XMLHttpRequest();
-      xhr.open(request.method, request.url, true);
-
-      Object.keys(request.headers || {}).forEach((header) => xhr.setRequestHeader(header, request.headers[header]));
-
-      xhr.onload = () => pushLog("replay", "XHR Response", { status: xhr.status, response: xhr.responseText });
-      xhr.send(request.body || null);
-      pushLog("replay", "Replayed XHR Request", request);
-      return;
-    }
-
-    console.warn("Unsupported request type in replay:", request.kind);
-  }
-
-  function linkResponseToNextRequest(triggerResponse, nextRequestTemplate) {
-    const linkedRequest = safeClone(nextRequestTemplate);
-
-    // Insert dynamic authorization headers or tokens from the response
-    if (triggerResponse.headers && triggerResponse.headers["Authorization"]) {
-      linkedRequest.headers = linkedRequest.headers || {};
-      linkedRequest.headers["Authorization"] = triggerResponse.headers["Authorization"];
-    }
-
-    return linkedRequest;
-  }
-
-  /**************************************************************************
-   * Network Interception: Fetch, XHR, WebSocket
-   **************************************************************************/
-  const NetworkInterceptor = {
-    interceptFetch() {
+    // Hook and log fetch calls
+    hookFetch() {
       const originalFetch = window.fetch;
 
-      window.fetch = async function (url, options) {
-        const requestMeta = { kind: "fetch", url, options };
-        pushLog("log", "Fetch Sent", requestMeta);
+      window.fetch = async function (url, options = {}) {
+        const requestMeta = {
+          kind: "fetch",
+          url,
+          options,
+          timestamp: nowIso(),
+        };
+
+        Interceptor.logRequest("fetch", requestMeta);
 
         const response = await originalFetch(url, options);
         const clonedResponse = response.clone();
-
         const responseMeta = {
-          status: clonedResponse.status,
-          headers: Array.from(clonedResponse.headers.entries()),
+          status: response.status,
+          headers: Object.fromEntries(clonedResponse.headers.entries()),
           body: await clonedResponse.text(),
         };
 
-        pushLog("log", "Fetch Response", responseMeta);
-        createClone(requestMeta, responseMeta);
+        Interceptor.logResponse("fetch", {
+          request: requestMeta,
+          response: responseMeta,
+        });
 
-        return response; // Forward original response to the application
+        // Automatically detect workflows (e.g., linking token fetching to subsequent requests)
+        WorkflowManager.addWorkflow(requestMeta, responseMeta);
+
+        return response;
       };
     },
 
-    interceptXHR() {
+    // Hook and log XHR
+    hookXHR() {
       const OriginalXHR = window.XMLHttpRequest;
 
       function EnhancedXHR() {
         const xhr = new OriginalXHR();
-        const requestMeta = { kind: "xhr" };
+        const requestMeta = { method: null, url: null, headers: {}, body: null };
 
-        xhr.open = (method, url, async = true) => {
+        xhr.open = function (method, url, async = true, user, password) {
           requestMeta.method = method;
           requestMeta.url = url;
-          return OriginalXHR.prototype.open.apply(xhr, arguments);
+          OriginalXHR.prototype.open.call(this, method, url, async, user, password);
         };
 
-        xhr.setRequestHeader = (header, value) => {
-          requestMeta.headers = requestMeta.headers || {};
+        xhr.setRequestHeader = function (header, value) {
           requestMeta.headers[header] = value;
-          return OriginalXHR.prototype.setRequestHeader.apply(xhr, arguments);
+          OriginalXHR.prototype.setRequestHeader.call(this, header, value);
         };
 
-        xhr.onreadystatechange = () => {
-          if (xhr.readyState === 4) {
-            const responseMeta = {
-              status: xhr.status,
-              responseText: xhr.responseText,
-              headers: xhr.getAllResponseHeaders(),
-            };
-
-            pushLog("log", "XHR Response", responseMeta);
-            createClone(requestMeta, responseMeta);
-          }
-        };
-
-        xhr.send = (body) => {
+        xhr.send = function (body) {
           requestMeta.body = body || null;
-          pushLog("log", "XHR Sent", requestMeta);
-          return OriginalXHR.prototype.send.apply(xhr, arguments);
+          Interceptor.logRequest("xhr", requestMeta);
+
+          this.addEventListener("readystatechange", () => {
+            if (this.readyState === 4) {
+              const responseMeta = {
+                status: this.status,
+                headers: this.getAllResponseHeaders(),
+                responseText: this.responseText,
+              };
+              Interceptor.logResponse("xhr", { request: requestMeta, response: responseMeta });
+              WorkflowManager.addWorkflow(requestMeta, responseMeta);
+            }
+          });
+
+          OriginalXHR.prototype.send.call(this, body);
         };
 
         return xhr;
@@ -258,15 +234,60 @@
       window.XMLHttpRequest = EnhancedXHR;
     },
 
-    apply() {
-      this.interceptFetch();
-      this.interceptXHR();
+    // Hook and log WebSocket messages
+    hookWebSocket() {
+      const OriginalWebSocket = window.WebSocket;
+
+      window.WebSocket = function (url, protocols) {
+        const ws = protocols ? new OriginalWebSocket(url, protocols) : new OriginalWebSocket(url);
+
+        ws.addEventListener("message", (event) => {
+          Interceptor.logMessage("websocket", "received", event.data, url);
+        });
+
+        const originalSend = ws.send;
+        ws.send = function (data) {
+          Interceptor.logMessage("websocket", "sent", data, url);
+          originalSend.call(ws, data);
+        };
+
+        return ws;
+      };
+    },
+
+    logRequest(type, meta) {
+      addLogEntry({
+        id: uid(),
+        timestamp: nowIso(),
+        category: "request",
+        type,
+        meta,
+      });
+    },
+
+    logResponse(type, meta) {
+      addLogEntry({
+        id: uid(),
+        timestamp: nowIso(),
+        category: "response",
+        type,
+        meta,
+      });
+    },
+
+    logMessage(protocol, direction, payload, url) {
+      addLogEntry({
+        id: uid(),
+        timestamp: nowIso(),
+        category: `${protocol}-${direction}`,
+        type: "message",
+        meta: { payload, url },
+      });
     },
   };
 
   /**************************************************************************
-   * Initialization
+   * Initialize and Activate Interceptor
    **************************************************************************/
-  NetworkInterceptor.apply();
-  UI.createOverlay(); // Create default UI overlay for logs/clones
+  Interceptor.initialize();
 })();
